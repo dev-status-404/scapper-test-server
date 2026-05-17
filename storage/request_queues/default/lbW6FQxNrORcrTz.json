@@ -1,0 +1,9 @@
+{
+	"id": "lbW6FQxNrORcrTz",
+	"json": "{\"id\":\"lbW6FQxNrORcrTz\",\"url\":\"https://i.instagram.com/api/v1/users/web_profile_info/?username=chrispathway\",\"loadedUrl\":\"https://i.instagram.com/api/v1/users/web_profile_info/?username=chrispathway\",\"uniqueKey\":\"https://i.instagram.com/api/v1/users/web_profile_info/?username=chrispathway-1778849655433-apx4uq\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{\"User-Agent\":\"Instagram 219.0.0.12.117 Android\",\"X-IG-App-ID\":\"936619743392459\",\"Accept\":\"application/json\",\"Cookie\":\"datr=0kkiaeILdPneRSbDgMmjtBSG; ig_did=3D16E48F-5E3E-44C0-B2BE-B7688D8E6FD3; ig_nrcb=1; mid=aUMwlAALAAHnOHtUS3Huq3KzE6cz; ps_l=1; ps_n=1; wd=1920x929; csrftoken=rfzbVIyDT1KjXvyGdMtOJJmdKM6DZpkZ; ds_user_id=75027948662; sessionid=75027948662%3AdofobGvCSmPQv8%3A2%3AAYg4dFEYYYW0CBAeWlY8nH4-LQDZe3Do26XeDQ5s3A; rur=\\\"CLN\\\\05475027948662\\\\0541810252103:01fe15de9c474283247df243e351ff1154fb52caface729d50096aef75d59c634e3cb66e\\\"\",\"X-CSRFToken\":\"rfzbVIyDT1KjXvyGdMtOJJmdKM6DZpkZ\"},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-05-15T12:54:20.363Z\"}",
+	"method": "GET",
+	"orderNo": null,
+	"retryCount": 0,
+	"uniqueKey": "https://i.instagram.com/api/v1/users/web_profile_info/?username=chrispathway-1778849655433-apx4uq",
+	"url": "https://i.instagram.com/api/v1/users/web_profile_info/?username=chrispathway"
+}

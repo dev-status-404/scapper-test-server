@@ -1,0 +1,12 @@
+{
+  "watch": ["src"],
+  "ext": "js,mjs,cjs,json",
+  "ignore": [
+    "storage/**",
+    "apify_storage/**",
+    "crawlee_storage/**",
+    ".crawlee/**",
+    "tmp/**",
+    "temp/**"
+  ]
+}
