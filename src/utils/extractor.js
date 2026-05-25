@@ -1,4 +1,7 @@
 const EMAIL_REGEX = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+const URL_WITH_SCHEME_REGEX = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
+const DOMAIN_URL_REGEX =
+  /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63})(?:\/[^\s<>"'`]*)?/gi;
 
 // Match phone numbers in specific formats:
 // +123456789012 (international with +)
@@ -8,16 +11,56 @@ const PHONE_REGEX =
   /(?:\+\d{1,4}[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/g;
 
 const uniqueValues = (values) => [...new Set(values.filter(Boolean))];
+const COMMON_TLDS = [
+  "com",
+  "net",
+  "org",
+  "io",
+  "co",
+  "ai",
+  "app",
+  "dev",
+  "biz",
+  "info",
+  "me",
+  "edu",
+  "gov",
+  "us",
+  "uk",
+  "ca",
+  "au",
+  "de",
+  "fr",
+  "es",
+  "pk",
+];
 
-const normalizeEmail = (value) => {
+const normalizeEmailCandidate = (value) => {
   if (typeof value !== "string") {
     return "";
   }
 
-  return value.trim().toLowerCase();
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+
+  const compact = normalized.replace(/[>,;:'"`]+$/g, "");
+  const withKnownTldBoundary = compact.match(
+    new RegExp(
+      `^([a-z0-9._%+-]+@[a-z0-9.-]+\\.(?:${COMMON_TLDS.join("|")}))(?:[a-z]{2,})?$`,
+      "i",
+    ),
+  );
+
+  if (withKnownTldBoundary) {
+    return withKnownTldBoundary[1].toLowerCase();
+  }
+
+  return compact;
 };
 
-const normalizePhone = (value) => {
+const normalizePhoneCandidate = (value) => {
   if (typeof value !== "string") {
     return "";
   }
@@ -35,7 +78,7 @@ const normalizePhone = (value) => {
   // (000)-0000-0000 or (000) 000-0000
   // 000-000-0000 or 000 000 0000
   const validPatterns = [
-    /^\+\d[\d\s.-]{7,}$/, // International: starts with +digit
+    /^\+\d[\d()\s.-]{7,}$/, // International: allows separators and area-code parentheses
     /^\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}$/, // US/Standard format
   ];
 
@@ -60,13 +103,85 @@ const normalizePhone = (value) => {
   return hasPlus ? `+${digitsOnly}` : digitsOnly;
 };
 
+const trimUrlPunctuation = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/^[([{'"`]+/, "")
+    .replace(/[)\]},;:!?'"`]+$/g, "");
+
+const normalizeUrl = (value) => {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = trimUrlPunctuation(value);
+  if (!trimmed || trimmed.includes("@")) {
+    return "";
+  }
+
+  try {
+    const withScheme = /^https?:\/\//i.test(trimmed)
+      ? trimmed
+      : `https://${trimmed}`;
+    const parsed = new URL(withScheme);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.toLowerCase();
+    if (parsed.pathname.length > 1) {
+      parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    } else {
+      parsed.pathname = "/";
+    }
+
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+};
+
+const collectRegexMatches = (
+  text,
+  pattern,
+  { skipWhenImmediatelyProtocolPrefixed = false } = {},
+) => {
+  const matches = [];
+  const regex = new RegExp(pattern.source, pattern.flags);
+
+  for (const match of text.matchAll(regex)) {
+    const raw = match?.[0];
+    const index = Number.isInteger(match?.index) ? match.index : -1;
+    if (!raw) {
+      continue;
+    }
+
+    // Avoid turning email domains like `name@example.com` into website candidates.
+    if (index > 0 && text[index - 1] === "@") {
+      continue;
+    }
+
+    if (
+      skipWhenImmediatelyProtocolPrefixed &&
+      text.slice(Math.max(0, index - 3), index) === "://"
+    ) {
+      continue;
+    }
+
+    matches.push(raw);
+  }
+
+  return matches;
+};
+
 const extractEmails = (text) => {
   if (typeof text !== "string" || !text.trim()) {
     return [];
   }
 
   const matches = text.match(EMAIL_REGEX) || [];
-  return uniqueValues(matches.map(normalizeEmail));
+  return uniqueValues(matches.map(normalizeEmailCandidate));
 };
 
 const extractPhones = (text) => {
@@ -75,7 +190,28 @@ const extractPhones = (text) => {
   }
 
   const matches = text.match(PHONE_REGEX) || [];
-  return uniqueValues(matches.map(normalizePhone));
+  return uniqueValues(matches.map(normalizePhoneCandidate));
 };
 
-export { extractEmails, extractPhones };
+const extractUrls = (text) => {
+  if (typeof text !== "string" || !text.trim()) {
+    return [];
+  }
+
+  const matches = [
+    ...collectRegexMatches(text, URL_WITH_SCHEME_REGEX),
+    ...collectRegexMatches(text, DOMAIN_URL_REGEX, {
+      skipWhenImmediatelyProtocolPrefixed: true,
+    }),
+  ];
+
+  return uniqueValues(matches.map(normalizeUrl));
+};
+
+export {
+  extractEmails,
+  extractPhones,
+  extractUrls,
+  normalizeEmailCandidate,
+  normalizePhoneCandidate,
+};

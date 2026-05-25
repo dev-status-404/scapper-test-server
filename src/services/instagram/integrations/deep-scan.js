@@ -1,6 +1,7 @@
 export {
   deepScanExternalUrl,
   deepScanUrl,
+  previewDeepScanRequest,
   shouldSkipDeepScanDomain,
   normalizeDeepScanUrl,
   validateUrlSafeToFetch,
@@ -16,4 +17,3 @@ export {
 } from "../deepScanService.js";
 
 export { default } from "../deepScanService.js";
-

@@ -17,13 +17,20 @@ import {
   startQueuedApifyRelationshipJob,
 } from "../services/instagram/apifyRelationshipRunService.js";
 import { instagramConfig } from "../config/instagram.js";
+import { previewDeepScanRequest } from "../services/deepScanService.js";
 import { getRemainingCredits } from "../services/scrapeCreditService.js";
+import { stripeService } from "../services/stripeService.js";
 import { sendError } from "../utils/errorHelper.js";
 import { t } from "../utils/translation.js";
 
 const getRequestContext = (req) => ({
   userId: String(req?.user?._id || ""),
   isAdmin: Boolean(req?.isAdmin),
+});
+
+const buildRealtimeHints = (userId) => ({
+  realtime_event: "scrape:progress",
+  realtime_room: `user:${String(userId || "")}`,
 });
 
 const resolveRelationshipProvider = ({ provider, withGraphQl }) => {
@@ -114,14 +121,61 @@ const deepScan = async (req, res) => {
       });
     }
 
-    const result = await InstagramService.deepScanExternalUrl(externalUrl);
+    const preview = await previewDeepScanRequest(externalUrl);
+    if (!preview.ok) {
+      return res.status(preview.statusCode || 400).json({
+        code: preview.statusCode || 400,
+        success: false,
+        message: t(preview.reason || "invalid-url"),
+      });
+    }
 
-    return res.status(200).json({
-      code: 200,
-      success: true,
-      message: t('deep-scan-completed'),
-      data: result,
-    });
+    if (preview.cached_result) {
+      return res.status(200).json({
+        code: 200,
+        success: true,
+        message: t('deep-scan-completed'),
+        data: preview.cached_result,
+      });
+    }
+
+    let creditCharged = false;
+    let shouldRefundCredit = false;
+
+    try {
+      if (preview.billable) {
+        await stripeService.deductCredits(req.user._id, 1);
+        creditCharged = true;
+      }
+
+      const result = await InstagramService.deepScanExternalUrl(
+        preview.normalized_url || externalUrl,
+      );
+
+      shouldRefundCredit =
+        creditCharged &&
+        (result?.cached === true ||
+          result?.status === "BLOCKED" ||
+          result?.status === "FAILED");
+
+      return res.status(200).json({
+        code: 200,
+        success: true,
+        message: t('deep-scan-completed'),
+        data: result,
+      });
+    } catch (error) {
+      shouldRefundCredit = creditCharged;
+      throw error;
+    } finally {
+      if (creditCharged && shouldRefundCredit) {
+        await stripeService.refundCredits(req.user._id, 1).catch((refundError) => {
+          console.error(
+            `[DeepScan] Credit refund failed for user ${req.user?._id}: ${refundError.message}`,
+          );
+        });
+      }
+    }
   } catch (error) {
     return sendError(res, error);
   }
@@ -223,6 +277,7 @@ const scrapeFollowersOrFollowing = async (req, res) => {
           estimated_cost: job.estimated_cost_usd || null,
           queued_reason: startResult.started ? null : startResult.reason,
           progress_url: `/api/beta-insta/scrape-followers/jobs/${job._id}`,
+          ...buildRealtimeHints(effectiveUserId),
         },
       });
     }
@@ -256,6 +311,7 @@ const scrapeFollowersOrFollowing = async (req, res) => {
         progress_url: queued.job?.id
           ? `/api/beta-insta/scrape-followers/jobs/${queued.job.id}`
           : null,
+        ...buildRealtimeHints(effectiveUserId),
         job: queued.job,
       },
     });

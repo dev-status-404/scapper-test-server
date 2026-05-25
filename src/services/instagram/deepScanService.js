@@ -1,6 +1,8 @@
 export {
   deepScanExternalUrl,
   deepScanUrl,
+  previewDeepScanRequest,
+  shouldRetryDeepScanWithoutProxy,
   shouldSkipDeepScanDomain,
   normalizeDeepScanUrl,
   validateUrlSafeToFetch,

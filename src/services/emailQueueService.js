@@ -1,52 +1,29 @@
 /**
- * Email Queue Service using BullMQ
+ * Email Queue Service using an in-process queue
  *
  * Architecture:
- *  - One Queue:   "email-campaign"
- *  - One Worker:  Processes each job → sends via nodemailer using the SMTP
- *                 credentials stored on the campaign's smtp_account_id.
- *  - Scalability: Run multiple Worker instances (separate processes/containers)
- *                 against the same Redis queue for horizontal scaling.
- *
- * Environment variables required:
- *   REDIS_HOST   (default: 127.0.0.1)
- *   REDIS_PORT   (default: 6379)
- *   REDIS_PASSWORD (optional)
+ *  - One in-memory queue: "email-campaign"
+ *  - One worker loop: processes each job and sends via nodemailer using the
+ *    SMTP credentials stored on the campaign's smtp_account_id.
  */
 
-import { Queue, Worker, QueueEvents } from "bullmq";
 import nodemailer from "nodemailer";
 import crypto from "crypto";
 import Campaign from "../models/campaign.model.js";
 import EmailTracking from "../models/emailTracking.model.js";
 import EmailTemplate from "../models/emailTemplate.model.js";
 import UserSmtpAccount from "../models/userSmtpAccount.model.js";
+import {
+  bindErrorContext,
+  captureException,
+  withMonitoringSpan,
+} from "../monitoring/index.js";
 import { createNotification } from "./notificationService.js";
-
-// ─── Redis connection ─────────────────────────────────────────────────────────
-
-// const redisConnection = {
-//   host: process.env.REDIS_HOST || "127.0.0.1",
-//   port: parseInt(process.env.REDIS_PORT || "6379", 10),
-//   ...(process.env.REDIS_PASSWORD
-//     ? { password: process.env.REDIS_PASSWORD }
-//     : {}),
-// };
-const redisConnection = {
-  host: process.env.REDIS_HOST || "127.0.0.1",
-  port: parseInt(process.env.REDIS_PORT || "6379", 10),
-  username: process.env.REDIS_USERNAME || "default",
-  ...(process.env.REDIS_PASSWORD
-    ? { password: process.env.REDIS_PASSWORD }
-    : {}),
-  ...(process.env.REDIS_TLS === "true" ? { tls: {} } : {}),
-  maxRetriesPerRequest: null,
-};
+import { InMemoryJobQueue } from "../utils/inMemoryJobQueue.js";
 
 // ─── Queue definition ─────────────────────────────────────────────────────────
 
-export const emailCampaignQueue = new Queue("email-campaign", {
-  connection: redisConnection,
+export const emailCampaignQueue = new InMemoryJobQueue("email-campaign", {
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: "exponential", delay: 5000 },
@@ -297,91 +274,133 @@ const markCampaignFinishedIfComplete = async (campaignId) => {
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
+let emailWorkerInstance = null;
+let emailWorkerListenersBound = false;
+
 export const createEmailWorker = () => {
-  const worker = new Worker(
-    "email-campaign",
+  if (emailWorkerInstance) {
+    return emailWorkerInstance;
+  }
+
+  emailWorkerInstance = emailCampaignQueue.setProcessor(
     async (job) => {
-      const {
-        campaignId,
-        leadId,
-        to,
-        leadName,
-        subject,
-        content,
-        fromEmail,
-        fromName,
-        replyTo,
-        smtpAccountId,
-        trackingId,
-      } = job.data;
-
-      // On the very first job for this campaign, flip status to SENDING
-      await Campaign.findOneAndUpdate(
-        { _id: campaignId, status: "SCHEDULED" },
-        { status: "SENDING", sent_at: new Date() },
-      ).catch(() => {});
-
-      // Fetch SMTP account
-      const smtpAccount = await UserSmtpAccount.findById(smtpAccountId);
-      if (!smtpAccount) throw new Error(`SMTP account ${smtpAccountId} not found`);
-
-      const transporter = createTransporter(smtpAccount);
-
-      const trackingParams = { campaignId, leadId, trackingId };
-      // Strip any stale tracking pixels baked into the stored content
-      const cleanContent = (content || "")
-        .replace(/<img[^>]+\/api\/campaign\/track\/[^>]*>/gi, "")
-        .replaceAll(TRACKING_PIXEL_MARKER, "");
-      let finalHtml = wrapEmailHtml(cleanContent, { subject });
-      finalHtml = normalizeButtonLinks(finalHtml);
-      finalHtml = addClickTracking(finalHtml, trackingParams);
-      finalHtml = addOpenTrackingPixel(finalHtml, trackingParams);
-
-      const pixelMatch = finalHtml.match(/<img[^>]+\/api\/campaign\/track\/[^>]+>/i);
-      console.log(`[EmailQueue] Tracking pixel embedded:`, pixelMatch ? pixelMatch[0] : "NOT FOUND - pixel missing from final HTML");
-
-      await transporter.sendMail({
-        from: fromName ? `"${fromName}" <${fromEmail}>` : fromEmail,
-        to,
-        replyTo: replyTo || undefined,
-        subject,
-        html: finalHtml,
-      });
-
-      await EmailTracking.updateOne(
-        { tracking_id: trackingId },
+      return withMonitoringSpan(
+        "queue.email.process",
         {
-          $set: {
-            delivered_at: new Date(),
-          },
-          $setOnInsert: {
-            campaign_id: campaignId,
-            lead_id: leadId,
-            tracking_id: trackingId,
-            clicked: false,
-            opened_at: null,
+          op: "queue.process",
+          attributes: {
+            "queue.name": "email-campaign",
+            "queue.job_id": job.id,
+            "campaign.id": job?.data?.campaignId || null,
+            "lead.id": job?.data?.leadId || null,
           },
         },
-        { upsert: true },
-      );
+        async () => {
+          const {
+            campaignId,
+            leadId,
+            to,
+            leadName,
+            subject,
+            content,
+            fromEmail,
+            fromName,
+            replyTo,
+            smtpAccountId,
+            trackingId,
+          } = job.data;
 
-      // A successful SMTP handoff counts as sent and delivered.
-      await Campaign.findByIdAndUpdate(campaignId, {
-        $inc: {
-          "analytics.sent": 1,
-          "analytics.delivered": 1,
+          await Campaign.findOneAndUpdate(
+            { _id: campaignId, status: "SCHEDULED" },
+            { status: "SENDING", sent_at: new Date() },
+          ).catch(() => {});
+
+          const smtpAccount = await UserSmtpAccount.findById(smtpAccountId);
+          if (!smtpAccount) throw new Error(`SMTP account ${smtpAccountId} not found`);
+
+          const transporter = createTransporter(smtpAccount);
+
+          const trackingParams = { campaignId, leadId, trackingId };
+          const cleanContent = (content || "")
+            .replace(/<img[^>]+\/api\/campaign\/track\/[^>]*>/gi, "")
+            .replaceAll(TRACKING_PIXEL_MARKER, "");
+          let finalHtml = wrapEmailHtml(cleanContent, { subject });
+          finalHtml = normalizeButtonLinks(finalHtml);
+          finalHtml = addClickTracking(finalHtml, trackingParams);
+          finalHtml = addOpenTrackingPixel(finalHtml, trackingParams);
+
+          const pixelMatch = finalHtml.match(/<img[^>]+\/api\/campaign\/track\/[^>]+>/i);
+          console.log(
+            `[EmailQueue] Tracking pixel embedded:`,
+            pixelMatch ? pixelMatch[0] : "NOT FOUND - pixel missing from final HTML",
+          );
+
+          await transporter.sendMail({
+            from: fromName ? `"${fromName}" <${fromEmail}>` : fromEmail,
+            to,
+            replyTo: replyTo || undefined,
+            subject,
+            html: finalHtml,
+          });
+
+          await EmailTracking.updateOne(
+            { tracking_id: trackingId },
+            {
+              $set: {
+                delivered_at: new Date(),
+              },
+              $setOnInsert: {
+                campaign_id: campaignId,
+                lead_id: leadId,
+                tracking_id: trackingId,
+                clicked: false,
+                opened_at: null,
+              },
+            },
+            { upsert: true },
+          );
+
+          await Campaign.findByIdAndUpdate(campaignId, {
+            $inc: {
+              "analytics.sent": 1,
+              "analytics.delivered": 1,
+            },
+          });
+          await markCampaignFinishedIfComplete(campaignId);
         },
-      });
-      await markCampaignFinishedIfComplete(campaignId);
+      );
     },
     {
-      connection: redisConnection,
       concurrency: parseInt(process.env.EMAIL_WORKER_CONCURRENCY || "10", 10),
     },
   );
 
-  worker.on("failed", async (job, err) => {
+  if (emailWorkerListenersBound) {
+    return emailWorkerInstance;
+  }
+
+  emailWorkerListenersBound = true;
+
+  emailWorkerInstance.on("failed", async (job, err) => {
     console.error(`[EmailQueue] Job ${job?.id} failed:`, err.message);
+    captureException(
+      err,
+      bindErrorContext({
+        tags: {
+          area: "queue",
+          queue: "email-campaign",
+          event: "job-failed",
+          job_id: job?.id || null,
+          campaign_id: job?.data?.campaignId || null,
+          lead_id: job?.data?.leadId || null,
+        },
+        extra: {
+          attempts_made: job?.attemptsMade || 0,
+          max_attempts: job?.opts?.attempts || 1,
+          recipient: job?.data?.to || null,
+        },
+      }),
+    );
     if (job?.data?.campaignId) {
       const maxAttempts = job?.opts?.attempts || 1;
       if ((job?.attemptsMade || 0) < maxAttempts) return;
@@ -396,7 +415,7 @@ export const createEmailWorker = () => {
     }
   });
 
-  return worker;
+  return emailWorkerInstance;
 };
 
 // ─── Public API ───────────────────────────────────────────────────────────────

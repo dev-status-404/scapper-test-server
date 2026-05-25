@@ -1,3 +1,4 @@
+import { extractUrls } from "../../utils/extractor.js";
 import { ProviderInvalidInputError } from "./errors.js";
 
 const RESERVED_INSTAGRAM_PATHS = new Set([
@@ -151,6 +152,7 @@ export const normalizeInstagramProfile = (raw = {}, source = "unknown") => {
   const externalUrls = [
     raw.externalUrl,
     raw.external_url,
+    ...extractUrls(raw.biography ?? raw.bio ?? ""),
     ...(Array.isArray(raw.externalUrls)
       ? raw.externalUrls.map((entry) => (typeof entry === "string" ? entry : entry?.url))
       : []),

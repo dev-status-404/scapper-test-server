@@ -6,10 +6,12 @@ import {
   deepScanUrl,
   discoverContactPageUrls,
   extractDeepScanContactsFromHtml,
-  tryAcquireDeepScanIsolation,
   isDeepScanRetryableError,
   normalizeDeepScanUrl,
+  previewDeepScanRequest,
+  shouldRetryDeepScanWithoutProxy,
   shouldSkipDeepScanDomain,
+  tryAcquireDeepScanIsolation,
   validateUrlSafeToFetch,
 } from "../../src/services/instagram/deepScanService.js";
 
@@ -65,10 +67,82 @@ test("deepScanUrl cache hit avoids HTTP request", async () => {
   assert.deepEqual(result.emails, ["hello@example-business.com"]);
 });
 
+test("previewDeepScanRequest marks cached results as non-billable", async () => {
+  const preview = await previewDeepScanRequest("https://example-business.com", {
+    resultModel: {
+      findOne: () => ({
+        lean: async () => ({
+          normalized_url: "https://example-business.com/",
+          root_domain: "example-business.com",
+          final_url: "https://example-business.com/",
+          status: "SUCCEEDED",
+          emails: ["hello@example-business.com"],
+          phone_numbers: [],
+          contact_page_urls: [],
+          expires_at: new Date(Date.now() + 60_000),
+        }),
+      }),
+    },
+  });
+
+  assert.equal(preview.ok, true);
+  assert.equal(preview.billable, false);
+  assert.equal(preview.cached_result?.cached, true);
+});
+
 test("retryable deep-scan errors include 502 provider failures", () => {
   assert.equal(isDeepScanRetryableError({ response: { status: 502 } }), true);
   assert.equal(isDeepScanRetryableError({ code: "ETIMEDOUT" }), true);
   assert.equal(isDeepScanRetryableError({ response: { status: 404 } }), false);
+});
+
+test("403 responses on proxy fetches retry once without proxy", async () => {
+  let calls = 0;
+
+  const result = await deepScanUrl("https://example.com/", {
+    cache: false,
+    resultModel: {
+      findOne: () => ({ lean: async () => null }),
+      findOneAndUpdate: async () => ({ _id: "scan-id" }),
+    },
+    axiosClient: {
+      get: async (_url, config) => {
+        calls += 1;
+
+        if (calls === 1) {
+          assert.equal(Boolean(config?.httpsAgent), true);
+          const error = new Error("Request failed with status code 403");
+          error.response = { status: 403 };
+          throw error;
+        }
+
+        assert.equal(Boolean(config?.httpsAgent), false);
+        return {
+          status: 200,
+          data: "<html><body>Contact hello@example.com</body></html>",
+          request: { res: { responseUrl: "https://example.com/" } },
+        };
+      },
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(result.emails, ["hello@example.com"]);
+});
+
+test("shouldRetryDeepScanWithoutProxy only retries proxy-auth and proxy-blocked responses", () => {
+  assert.equal(
+    shouldRetryDeepScanWithoutProxy({ response: { status: 403 } }, { proxyUsed: true }),
+    true,
+  );
+  assert.equal(
+    shouldRetryDeepScanWithoutProxy({ response: { status: 404 } }, { proxyUsed: true }),
+    false,
+  );
+  assert.equal(
+    shouldRetryDeepScanWithoutProxy({ response: { status: 403 } }, { proxyUsed: false }),
+    false,
+  );
 });
 
 test("duplicate URL queue id is stable after normalization", () => {
@@ -153,26 +227,26 @@ test("same scan result can be attached to multiple leads without replacing conta
   ]);
 });
 
-test("deep scan isolation delays only the saturated user/domain", () => {
-  const first = tryAcquireDeepScanIsolation({
+test("deep scan isolation delays only the saturated user/domain", async () => {
+  const first = await tryAcquireDeepScanIsolation({
     user_id: "user-a",
     url: "https://example.com/",
   });
   assert.equal(first.acquired, true);
 
-  const sameDomainOtherUser = tryAcquireDeepScanIsolation({
+  const sameDomainOtherUser = await tryAcquireDeepScanIsolation({
     user_id: "user-b",
     url: "https://www.example.com/contact",
   });
   assert.equal(sameDomainOtherUser.acquired, false);
   assert.equal(sameDomainOtherUser.reason, "domain-concurrency-limit");
 
-  const differentDomainOtherUser = tryAcquireDeepScanIsolation({
+  const differentDomainOtherUser = await tryAcquireDeepScanIsolation({
     user_id: "user-b",
     url: "https://another-example.com/",
   });
   assert.equal(differentDomainOtherUser.acquired, true);
 
-  differentDomainOtherUser.release();
-  first.release();
+  await differentDomainOtherUser.release();
+  await first.release();
 });

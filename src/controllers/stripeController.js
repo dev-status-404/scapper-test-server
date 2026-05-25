@@ -62,9 +62,18 @@ export const getSubscription = async (req, res) => {
  */
 export const createCheckout = async (req, res) => {
   try {
-    const { plan_name, success_url, cancel_url } = req.body;
-    const coupon_code = req.body.coupon_code ?? null;
-    const interval = req.body.interval === "year" ? "year" : "month";
+    const plan_name =
+      req.body?.plan_name ?? req.body?.planName ?? null;
+    const success_url =
+      req.body?.success_url ?? req.body?.successUrl ?? null;
+    const cancel_url =
+      req.body?.cancel_url ?? req.body?.cancelUrl ?? null;
+    const coupon_code =
+      req.body?.coupon_code ?? req.body?.couponCode ?? null;
+    const interval =
+      (req.body?.interval ?? req.body?.billing_interval) === "year"
+        ? "year"
+        : "month";
 
     if (!plan_name || !success_url || !cancel_url) {
       return res.status(400).json({

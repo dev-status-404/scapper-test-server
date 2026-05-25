@@ -5,6 +5,12 @@ import { errorConverter, errorHandler } from "./middlewares/error.js";
 import ApiError from "./utils/ApiError.js";
 import dbConnection from "./config/db.js";
 import dotenv from "dotenv";
+import logger from "./utils/logger.js";
+import {
+  isSentryEnabled,
+  monitoringRequestMiddleware,
+  Sentry,
+} from "./monitoring/index.js";
 import { startCampaignCron } from "./services/cronService.js";
 import { createEmailWorker } from "./services/emailQueueService.js";
 import { createInstagramFollowersWorker } from "./services/instagramFollowersQueueService.js";
@@ -67,6 +73,7 @@ app.use("/api/billing/webhook", express.raw({ type: "application/json" }));
 
 // Parse JSON request body
 app.use(express.json());
+app.use(monitoringRequestMiddleware(logger));
 
 dbConnection();
 
@@ -111,6 +118,10 @@ app.use("/api/billing", stripeRoutes);
 app.use((req, res, next) => {
   next(new ApiError(httpStatus.NOT_FOUND, "Not found"));
 });
+
+if (isSentryEnabled()) {
+  Sentry.setupExpressErrorHandler(app);
+}
 
 // Convert error to ApiError, if needed
 app.use(errorConverter);

@@ -18,6 +18,9 @@ const getStripe = () => {
   return _stripe;
 };
 
+const withStatusCode = (message, statusCode, extra = {}) =>
+  Object.assign(new Error(message), { statusCode, ...extra });
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
@@ -28,6 +31,99 @@ const getActiveSubscription = async (userId) => {
     user_id: userId,
     status: { $in: ["trialing", "active", "past_due"] },
   }).populate("plan_id");
+};
+
+const ensurePlanStripePricing = async (plan) => {
+  if (!plan) {
+    throw withStatusCode("Plan not found", 404);
+  }
+
+  if (Number(plan.price_cents || 0) <= 0) {
+    throw withStatusCode(
+      `Plan "${plan.name}" is not billable through Stripe checkout`,
+      400,
+    );
+  }
+
+  let changed = false;
+  const stripe = getStripe();
+  const currency = process.env.STRIPE_CURRENCY || "usd";
+
+  if (!plan.stripe_product_id) {
+    const product = await stripe.products.create({
+      name: plan.display_name || plan.name,
+      metadata: { plan_name: plan.name },
+    });
+    plan.stripe_product_id = product.id;
+    changed = true;
+  }
+
+  if (!plan.stripe_price_id) {
+    const monthlyPrice = await stripe.prices.create({
+      product: plan.stripe_product_id,
+      unit_amount: plan.price_cents,
+      currency,
+      recurring: { interval: "month" },
+      metadata: { plan_name: plan.name, billing_interval: "month" },
+    });
+    plan.stripe_price_id = monthlyPrice.id;
+    changed = true;
+  }
+
+  if (Number(plan.price_cents_annual || 0) > 0 && !plan.stripe_price_id_annual) {
+    const annualPrice = await stripe.prices.create({
+      product: plan.stripe_product_id,
+      unit_amount: plan.price_cents_annual,
+      currency,
+      recurring: { interval: "year" },
+      metadata: { plan_name: plan.name, billing_interval: "year" },
+    });
+    plan.stripe_price_id_annual = annualPrice.id;
+    changed = true;
+  }
+
+  if (changed) {
+    await plan.save();
+  }
+
+  return plan;
+};
+
+const getPriceCurrency = async (priceId) => {
+  if (!priceId) return null;
+  const price = await getStripe().prices.retrieve(priceId);
+  return price?.currency || null;
+};
+
+const assertCheckoutCurrencyCompatibility = async ({ userId, targetPriceId }) => {
+  if (!userId || !targetPriceId) return;
+
+  const subscription = await getActiveSubscription(userId);
+  if (!subscription?.stripe_subscription_id) {
+    return;
+  }
+
+  const stripeSubscription = await getStripe().subscriptions.retrieve(
+    subscription.stripe_subscription_id,
+  );
+  const currentCurrency =
+    stripeSubscription?.items?.data?.[0]?.price?.currency || null;
+  const targetCurrency = await getPriceCurrency(targetPriceId);
+
+  if (
+    currentCurrency &&
+    targetCurrency &&
+    currentCurrency.toLowerCase() !== targetCurrency.toLowerCase()
+  ) {
+    throw withStatusCode(
+      `Currency mismatch: your current subscription is in ${currentCurrency.toUpperCase()} but the selected plan is in ${targetCurrency.toUpperCase()}. Please use a matching currency price or update the plan's Stripe price IDs.`,
+      400,
+      {
+        currentCurrency,
+        targetCurrency,
+      },
+    );
+  }
 };
 
 /**
@@ -110,7 +206,6 @@ const getOrCreateStripeCustomer = async (user) => {
     email: user.email,
     name: `${user.first_name ?? ""} ${user.last_name ?? ""}`.trim() || user.email,
     metadata: { user_id: String(user._id) },
-    currency: process.env.STRIPE_CURRENCY || "usd",
   });
 
   await User.findByIdAndUpdate(user._id, { stripe_customer_id: customer.id });
@@ -153,7 +248,8 @@ const startFreeTrial = async (userId) => {
  */
 const createCheckoutSession = async ({ userId, planName, successUrl, cancelUrl, couponCode, interval = "month" }) => {
   const plan = await Plan.findOne({ name: planName, is_active: true });
-  if (!plan) throw new Error(`Plan "${planName}" not found`);
+  if (!plan) throw withStatusCode(`Plan "${planName}" not found`, 404);
+  await ensurePlanStripePricing(plan);
 
   // Select the correct Stripe price based on requested billing interval
   const priceId = interval === "year" && plan.stripe_price_id_annual
@@ -161,11 +257,16 @@ const createCheckoutSession = async ({ userId, planName, successUrl, cancelUrl, 
     : plan.stripe_price_id;
 
   if (!priceId) {
-    throw new Error(`Plan "${planName}" has no Stripe price configured for interval "${interval}"`);
+    throw withStatusCode(
+      `Plan "${planName}" has no Stripe price configured for interval "${interval}"`,
+      400,
+    );
   }
 
   const user = await User.findById(userId);
-  if (!user) throw new Error("User not found");
+  if (!user) throw withStatusCode("User not found", 404);
+
+  await assertCheckoutCurrencyCompatibility({ userId, targetPriceId: priceId });
 
   const customerId = await getOrCreateStripeCustomer(user);
 
@@ -200,7 +301,15 @@ const createCheckoutSession = async ({ userId, planName, successUrl, cancelUrl, 
     }
   }
 
-  const session = await getStripe().checkout.sessions.create(sessionParams);
+  const session = await getStripe().checkout.sessions.create(sessionParams).catch((err) => {
+    if (err?.raw?.message?.toLowerCase().includes("currency")) {
+      throw withStatusCode(
+        `Currency mismatch during checkout: ${err.raw.message}`,
+        400,
+      );
+    }
+    throw err;
+  });
   return session;
 };
 
@@ -216,6 +325,10 @@ const changePlan = async (userId, newPlanName, interval = "month") => {
   }
 
   const newPlan = await Plan.findOne({ name: newPlanName, is_active: true });
+  if (!newPlan) {
+    throw withStatusCode(`Plan "${newPlanName}" not found`, 404);
+  }
+  await ensurePlanStripePricing(newPlan);
   const targetPriceId = interval === "year" && newPlan?.stripe_price_id_annual
     ? newPlan.stripe_price_id_annual
     : newPlan?.stripe_price_id;

@@ -30,7 +30,10 @@ router.post("/scrape",
    ...scraperGuard, BetaInstaController.scrapeProfile);
 router.post("/deep-scan", 
   // scrapeLimiter,
-   ...scraperGuard, BetaInstaController.deepScan);
+  auth(["USER", "ADMIN"]),
+  requireActiveSubscription,
+  BetaInstaController.deepScan,
+);
 router.post(
   "/webhooks/apify/instagram",
   BetaInstaController.apifyInstagramWebhook,

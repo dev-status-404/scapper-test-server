@@ -1,8 +1,17 @@
-import { Queue, Worker, QueueEvents } from "bullmq";
 import createError from "http-errors";
 import InstagramService from "./instagram/index.js";
 import { buildRelationshipScrapeJobId } from "./instagram/relationshipJobUtils.js";
-import { normalizeRelationshipRequestType } from "./instagram/relationshipTypes.js";
+import {
+  normalizeRelationshipRequestType,
+  toRelationshipDirection,
+} from "./instagram/relationshipTypes.js";
+import {
+  bindErrorContext,
+  captureException,
+  withMonitoringSpan,
+} from "../monitoring/index.js";
+import { getIO } from "../websockets/index.js";
+import { InMemoryJobQueue } from "../utils/inMemoryJobQueue.js";
 
 // const redisConnection = {
 //   host: process.env.REDIS_HOST || "127.0.0.1",
@@ -11,17 +20,6 @@ import { normalizeRelationshipRequestType } from "./instagram/relationshipTypes.
 //     ? { password: process.env.REDIS_PASSWORD }
 //     : {}),
 // };
-const redisConnection = {
-  host: process.env.REDIS_HOST || "127.0.0.1",
-  port: parseInt(process.env.REDIS_PORT || "6379", 10),
-  username: process.env.REDIS_USERNAME || "default",
-  ...(process.env.REDIS_PASSWORD
-    ? { password: process.env.REDIS_PASSWORD }
-    : {}),
-  ...(process.env.REDIS_TLS === "true" ? { tls: {} } : {}),
-  maxRetriesPerRequest: null,
-};
-
 const FOLLOWERS_QUEUE_NAME = "instagram-followers-scrape";
 const TERMINAL_JOB_STATES = new Set(["completed", "failed"]);
 const PAUSABLE_JOB_STATES = new Set(["waiting", "delayed", "prioritized"]);
@@ -52,9 +50,12 @@ const FOLLOWERS_WORKER_LIMIT_DURATION_MS = parseInt(
 );
 const FOLLOWERS_WORKER_RATE_LIMIT_ENABLED =
   process.env.INSTAGRAM_FOLLOWERS_WORKER_RATE_LIMIT_ENABLED === "true";
+const FOLLOWERS_PAUSE_CHECK_TTL_MS = Math.max(
+  0,
+  parseInt(process.env.INSTAGRAM_FOLLOWERS_PAUSE_CHECK_TTL_MS || "2000", 10),
+);
 
-export const instagramFollowersQueue = new Queue(FOLLOWERS_QUEUE_NAME, {
-  connection: redisConnection,
+export const instagramFollowersQueue = new InMemoryJobQueue(FOLLOWERS_QUEUE_NAME, {
   defaultJobOptions: {
     attempts: FOLLOWERS_JOB_ATTEMPTS,
     backoff: {
@@ -78,13 +79,6 @@ export const instagramFollowersQueue = new Queue(FOLLOWERS_QUEUE_NAME, {
     },
   },
 });
-
-export const instagramFollowersQueueEvents = new QueueEvents(
-  FOLLOWERS_QUEUE_NAME,
-  {
-    connection: redisConnection,
-  },
-);
 
 const serializeJob = async (job) => {
   if (!job) {
@@ -115,6 +109,97 @@ const serializeJob = async (job) => {
 };
 
 const normalizeUserId = (value) => String(value || "").trim();
+
+const mapJobStateToRealtimeStatus = (state, paused) => {
+  if (paused) return state === "active" ? "PAUSING" : "PAUSED";
+  if (state === "completed") return "COMPLETED";
+  if (state === "failed") return "FAILED";
+  if (state === "active") return "RUNNING";
+  return "QUEUED";
+};
+
+const mapJobStateToRealtimeStage = (state, paused) => {
+  if (paused) return state === "active" ? "PAUSING" : "PAUSED";
+  if (state === "completed") return "COMPLETED";
+  if (state === "failed") return "FAILED";
+  if (state === "active") return "RUNNING";
+  return "QUEUED";
+};
+
+const emitFollowersJobRealtime = ({
+  job,
+  state,
+  status,
+  stage,
+  reason = null,
+  result = null,
+  error = null,
+  progress,
+}) => {
+  const userId = normalizeUserId(job?.data?.user_id);
+  if (!userId || !job?.id) return;
+
+  const paused = Boolean(job?.data?.__control?.paused);
+  const payload = {
+    event: "scrape:progress",
+    queue: FOLLOWERS_QUEUE_NAME,
+    job_id: String(job.id),
+    user_id: userId,
+    target_username: job?.data?.targetUsername || null,
+    type: job?.data?.type || null,
+    relationship_type: toRelationshipDirection(job?.data?.type || "followers"),
+    provider: job?.data?.provider || null,
+    queue_state: state || null,
+    status: status || mapJobStateToRealtimeStatus(state, paused),
+    stage: stage || mapJobStateToRealtimeStage(state, paused),
+    progress: typeof progress === "number" ? progress : job.progress || 0,
+    paused,
+    pause_requested: Boolean(job?.data?.__control?.pauseRequested),
+    reason,
+    error,
+    result,
+  };
+
+  try {
+    const io = getIO();
+    io.to(`user:${userId}`).emit("scrape:progress", payload);
+  } catch (wsError) {
+    console.warn(
+      `[Instagram Queue] WebSocket emit failed (non-fatal): ${wsError.message}`,
+    );
+  }
+};
+
+const createPauseChecker = (jobId) => {
+  let lastCheckedAt = 0;
+  let lastPauseRequested = false;
+  let inFlightCheck = null;
+
+  return async () => {
+    const now = Date.now();
+
+    if (inFlightCheck) {
+      return inFlightCheck;
+    }
+
+    if (now - lastCheckedAt < FOLLOWERS_PAUSE_CHECK_TTL_MS) {
+      return lastPauseRequested;
+    }
+
+    inFlightCheck = (async () => {
+      const freshJob = await instagramFollowersQueue.getJob(jobId);
+      lastPauseRequested = Boolean(freshJob?.data?.__control?.pauseRequested);
+      lastCheckedAt = Date.now();
+      return lastPauseRequested;
+    })();
+
+    try {
+      return await inFlightCheck;
+    } finally {
+      inFlightCheck = null;
+    }
+  };
+};
 
 const assertJobAccess = (job, { userId, isAdmin = false } = {}) => {
   if (!job) {
@@ -178,6 +263,14 @@ export const enqueueRelationshipScrapeJob = async (payload) => {
     },
   );
 
+  emitFollowersJobRealtime({
+    job,
+    state: "waiting",
+    status: "QUEUED",
+    stage: "QUEUED",
+    reason: "job-enqueued",
+  });
+
   return {
     created: true,
     job: await serializeJob(job),
@@ -221,6 +314,13 @@ export const pauseFollowersScrapeJob = async (jobId, context = {}) => {
       pausedAt: new Date().toISOString(),
     });
     const updated = await instagramFollowersQueue.getJob(jobId);
+    emitFollowersJobRealtime({
+      job: updated,
+      state,
+      status: "PAUSING",
+      stage: "PAUSING",
+      reason: "followers-scrape-job-pause-requested",
+    });
     return {
       changed: true,
       reason: "followers-scrape-job-pause-requested",
@@ -253,6 +353,14 @@ export const pauseFollowersScrapeJob = async (jobId, context = {}) => {
       delay: PAUSED_DELAY_MS,
     });
 
+    emitFollowersJobRealtime({
+      job: recreated,
+      state: "delayed",
+      status: "PAUSED",
+      stage: "PAUSED",
+      reason: "followers-scrape-job-paused",
+    });
+
     return {
       changed: true,
       reason: "followers-scrape-job-paused",
@@ -265,6 +373,14 @@ export const pauseFollowersScrapeJob = async (jobId, context = {}) => {
   }
 
   const updated = await instagramFollowersQueue.getJob(jobId);
+
+  emitFollowersJobRealtime({
+    job: updated,
+    state: "delayed",
+    status: "PAUSED",
+    stage: "PAUSED",
+    reason: "followers-scrape-job-paused",
+  });
 
   return {
     changed: true,
@@ -309,6 +425,14 @@ export const resumeFollowersScrapeJob = async (jobId, context = {}) => {
 
   const updated = await instagramFollowersQueue.getJob(jobId);
 
+  emitFollowersJobRealtime({
+    job: updated,
+    state: state === "delayed" ? "waiting" : state,
+    status: state === "delayed" ? "QUEUED" : "RUNNING",
+    stage: state === "delayed" ? "QUEUED" : "RUNNING",
+    reason: "followers-scrape-job-resumed",
+  });
+
   return {
     changed: true,
     reason: "followers-scrape-job-resumed",
@@ -325,6 +449,14 @@ export const deleteFollowersScrapeJob = async (jobId, context = {}) => {
   if (state === "active") {
     throw createError(409, "followers-scrape-job-active-cannot-delete");
   }
+
+  emitFollowersJobRealtime({
+    job,
+    state,
+    status: "DELETED",
+    stage: "DELETED",
+    reason: "followers-scrape-job-deleted",
+  });
 
   await job.remove();
 
@@ -374,10 +506,7 @@ export const getFollowersQueueDiagnostics = async () => {
 
   return {
     queue: FOLLOWERS_QUEUE_NAME,
-    redis: {
-      host: redisConnection.host,
-      port: redisConnection.port,
-    },
+    backend: "memory",
     worker: {
       started: Boolean(followersWorkerInstance),
       concurrency: FOLLOWERS_WORKER_CONCURRENCY,
@@ -394,6 +523,7 @@ export const getFollowersQueueDiagnostics = async () => {
 };
 
 let followersWorkerInstance = null;
+let followersWorkerListenersBound = false;
 
 export const createInstagramFollowersWorker = () => {
   if (followersWorkerInstance) {
@@ -404,59 +534,74 @@ export const createInstagramFollowersWorker = () => {
     JSON.stringify({
       event: "instagram_relationship_worker_starting",
       queue: FOLLOWERS_QUEUE_NAME,
+      backend: "memory",
       concurrency: FOLLOWERS_WORKER_CONCURRENCY,
       rate_limit_enabled: FOLLOWERS_WORKER_RATE_LIMIT_ENABLED,
       limiter_max: FOLLOWERS_WORKER_LIMIT_MAX,
       limiter_duration_ms: FOLLOWERS_WORKER_LIMIT_DURATION_MS,
-      redis_host: redisConnection.host,
-      redis_port: redisConnection.port,
     }),
   );
 
-  followersWorkerInstance = new Worker(
-    FOLLOWERS_QUEUE_NAME,
+  followersWorkerInstance = instagramFollowersQueue.setProcessor(
     async (job) => {
-      const checkPause = async () => {
-        const fresh = await instagramFollowersQueue.getJob(job.id);
-        return Boolean(fresh?.data?.__control?.pauseRequested);
-      };
+      return withMonitoringSpan(
+        "queue.instagramRelationship.process",
+        {
+          op: "queue.process",
+          attributes: {
+            "queue.name": FOLLOWERS_QUEUE_NAME,
+            "queue.job_id": job.id,
+            "user.id": job?.data?.user_id || null,
+            "target.username": job?.data?.targetUsername || null,
+            "instagram.relationship_type": job?.data?.type || null,
+            provider: job?.data?.provider || null,
+          },
+        },
+        async () => {
+          const checkPause = createPauseChecker(job.id);
 
-      const response = await InstagramService.scrapeFollowersOrFollowing({
-        ...job.data,
-        job_id: job.id,
-        __checkPause: checkPause,
-      });
+          const response = await InstagramService.scrapeFollowersOrFollowing({
+            ...job.data,
+            job_id: job.id,
+            __checkPause: checkPause,
+          });
 
-      if (!response?.success) {
-        const error = new Error(
-          response?.message || "instagram-followers-scrape-failed",
-        );
-        error.response = response;
-        throw error;
-      }
+          if (!response?.success) {
+            const error = new Error(
+              response?.message || "instagram-followers-scrape-failed",
+            );
+            error.response = response;
+            throw error;
+          }
 
-      return {
-        code: response.code,
-        success: response.success,
-        message: response.message,
-        data: response.data || null,
-      };
+          return {
+            code: response.code,
+            success: response.success,
+            message: response.message,
+            data: response.data || null,
+          };
+        },
+      );
     },
     {
-      connection: redisConnection,
       concurrency: FOLLOWERS_WORKER_CONCURRENCY,
-      ...(FOLLOWERS_WORKER_RATE_LIMIT_ENABLED
-        ? {
-            limiter: {
-              max: FOLLOWERS_WORKER_LIMIT_MAX,
-              duration: FOLLOWERS_WORKER_LIMIT_DURATION_MS,
-            },
-          }
-        : {}),
     },
   );
 
+  if (followersWorkerListenersBound) {
+    return followersWorkerInstance;
+  }
+
+  followersWorkerListenersBound = true;
+
   followersWorkerInstance.on("active", (job) => {
+    emitFollowersJobRealtime({
+      job,
+      state: "active",
+      status: "RUNNING",
+      stage: "RUNNING",
+      reason: "followers-scrape-job-started",
+    });
     console.log(
       JSON.stringify({
         event: "instagram_relationship_job_active",
@@ -470,6 +615,14 @@ export const createInstagramFollowersWorker = () => {
   });
 
   followersWorkerInstance.on("completed", (job, result) => {
+    emitFollowersJobRealtime({
+      job,
+      state: "completed",
+      status: "COMPLETED",
+      stage: "COMPLETED",
+      reason: "followers-scrape-job-completed",
+      result,
+    });
     console.log(
       JSON.stringify({
         event: "instagram_relationship_job_completed",
@@ -488,6 +641,14 @@ export const createInstagramFollowersWorker = () => {
   });
 
   followersWorkerInstance.on("failed", (job, err) => {
+    emitFollowersJobRealtime({
+      job,
+      state: "failed",
+      status: "FAILED",
+      stage: "FAILED",
+      reason: "followers-scrape-job-failed",
+      error: err?.response?.message || err?.message || null,
+    });
     console.error(
       JSON.stringify({
         event: "instagram_relationship_job_failed",
@@ -497,6 +658,24 @@ export const createInstagramFollowersWorker = () => {
         type: job?.data?.type || null,
         provider: job?.data?.provider || null,
         error_message: err?.response?.message || err.message,
+      }),
+    );
+    captureException(
+      err,
+      bindErrorContext({
+        tags: {
+          area: "queue",
+          queue: FOLLOWERS_QUEUE_NAME,
+          event: "job-failed",
+          job_id: job?.id || null,
+          user_id: job?.data?.user_id || null,
+          provider: job?.data?.provider || null,
+        },
+        extra: {
+          target_username: job?.data?.targetUsername || null,
+          relationship_type: job?.data?.type || null,
+          attempts_made: job?.attemptsMade || 0,
+        },
       }),
     );
   });

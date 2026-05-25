@@ -1,7 +1,7 @@
 [
   {
     "domain": ".instagram.com",
-    "expirationDate": 1808453328.693401,
+    "expirationDate": 1810877916.461989,
     "hostOnly": false,
     "httpOnly": true,
     "name": "datr",
@@ -10,11 +10,11 @@
     "secure": true,
     "session": false,
     "storeId": "0",
-    "value": "z3a7af79MT2HTuvbeZzsmUES"
+    "value": "23XgaWVreUizo1jS190DjII5"
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1805429328.693457,
+    "expirationDate": 1807853916.462011,
     "hostOnly": false,
     "httpOnly": true,
     "name": "ig_did",
@@ -23,37 +23,50 @@
     "secure": true,
     "session": false,
     "storeId": "0",
-    "value": "9E99EC7F-5831-48D0-9ABD-29E6130542A1"
+    "value": "A0FC8276-A47E-4632-9EE5-E9BE30D6D195"
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1808453334,
+    "expirationDate": 1810877916.462029,
     "hostOnly": false,
-    "httpOnly": false,
+    "httpOnly": true,
     "name": "mid",
     "path": "/",
-    "sameSite": "unspecified",
+    "sameSite": "no_restriction",
     "secure": true,
     "session": false,
     "storeId": "0",
-    "value": "abt20AALAAF-EY5mXl_3BHVXQP4h"
+    "value": "aeB12wALAAFqnJkmbIgJdvbtU0GI"
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1807853746.641164,
+    "expirationDate": 1814199265.649786,
     "hostOnly": false,
     "httpOnly": false,
-    "name": "ig_nrcb",
+    "name": "csrftoken",
     "path": "/",
     "sameSite": "unspecified",
     "secure": true,
     "session": false,
     "storeId": "0",
-    "value": "1"
+    "value": "wNOXZKe304xX5rMOSiT9G9kimIy7Of0i"
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1812814480.710208,
+    "expirationDate": 1787415265.650207,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "ds_user_id",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "61337513906"
+  },
+  {
+    "domain": ".instagram.com",
+    "expirationDate": 1813441436.991237,
     "hostOnly": false,
     "httpOnly": true,
     "name": "ps_l",
@@ -66,7 +79,7 @@
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1812814480.710358,
+    "expirationDate": 1813441436.991336,
     "hostOnly": false,
     "httpOnly": true,
     "name": "ps_n",
@@ -79,7 +92,7 @@
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1779396722,
+    "expirationDate": 1780244030,
     "hostOnly": false,
     "httpOnly": false,
     "name": "wd",
@@ -92,42 +105,16 @@
   },
   {
     "domain": ".instagram.com",
-    "expirationDate": 1813351937.532988,
+    "expirationDate": 1811175242.395299,
     "hostOnly": false,
-    "httpOnly": false,
-    "name": "csrftoken",
+    "httpOnly": true,
+    "name": "sessionid",
     "path": "/",
     "sameSite": "unspecified",
     "secure": true,
     "session": false,
     "storeId": "0",
-    "value": "9nzsIzuzOfnGa0WkPEBQwQ8JNLjpmjHn"
-  },
-  {
-    "domain": ".instagram.com",
-    "expirationDate": 1786567937.533151,
-    "hostOnly": false,
-    "httpOnly": false,
-    "name": "ds_user_id",
-    "path": "/",
-    "sameSite": "no_restriction",
-    "secure": true,
-    "session": false,
-    "storeId": "0",
-    "value": "77120894431"
-  },
-  {
-    "domain": ".instagram.com",
-    "expirationDate": 1810327932.73011,
-    "hostOnly": false,
-    "httpOnly": true,
-    "name": "sessionid",
-    "path": "/",
-    "sameSite": "no_restriction",
-    "secure": true,
-    "session": false,
-    "storeId": "0",
-    "value": "77120894431%3AaH5FFvuDjIbByT%3A17%3AAYj1hA043-g5ddt_4mQCumynSvmvU1epPUNJ5liUwQ"
+    "value": "61337513906%3A4sB2Kt4g24AwQc%3A26%3AAYidaImIbk1zwK-tOVPg_atQN7BcgwQ72-NA3xHyew"
   },
   {
     "domain": ".instagram.com",
@@ -139,6 +126,6 @@
     "secure": true,
     "session": true,
     "storeId": "0",
-    "value": "\"CLN\\05477120894431\\0541810327937:01fe1c8d4fcdea77932ee7a52131ac12b3861aa627aa46fe92d5c57337120e4c82cf86b3\""
+    "value": "\"CLN\\05461337513906\\0541811175265:01fe2e7d09102711c1a8a4d3b50f551348443e2ae047d93fd927510ffca7ff1dbabda3f4\""
   }
 ]

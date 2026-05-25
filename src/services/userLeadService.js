@@ -20,6 +20,81 @@ import Lead from "../models/lead.model.js";
 const toObjectId = (id) =>
   mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
 
+const hasMeaningfulValue = (value) => {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.trim() !== "";
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+};
+
+const normalizeEmailList = (emails = []) =>
+  [...new Set((emails || []).map((email) => String(email || "").trim().toLowerCase()).filter(Boolean))];
+
+const normalizePhoneList = (phones = []) =>
+  [...new Set((phones || []).map((phone) => String(phone || "").trim()).filter(Boolean))];
+
+const buildCachedLeadMergeUpdate = (payload = {}) => {
+  const setFields = {};
+  const setCandidates = [
+    "first_name",
+    "last_name",
+    "company",
+    "message",
+    "source_url",
+    "source_rul",
+    "instagram_profile_id",
+    "username",
+    "full_name",
+    "bio",
+    "avatar_url",
+    "avatar_rul",
+    "followers",
+    "following",
+    "follower_count",
+    "following_count",
+    "total_posts",
+    "category",
+    "external_url",
+    "external_url_linkshimmed",
+    "external_urls",
+    "is_private",
+    "is_verified",
+    "is_public",
+    "fb_profile_biolink",
+    "highlight_reel_count",
+    "links",
+    "scraped_from_username",
+    "relationship_type",
+    "scrape_status",
+    "type",
+  ];
+
+  for (const field of setCandidates) {
+    if (hasMeaningfulValue(payload[field])) {
+      setFields[field] = payload[field];
+    }
+  }
+
+  const update = {};
+  if (Object.keys(setFields).length > 0) {
+    update.$set = setFields;
+  }
+
+  const emails = normalizeEmailList(payload.emails || []);
+  const phoneNumbers = normalizePhoneList(payload.phone_numbers || []);
+
+  if (emails.length > 0 || phoneNumbers.length > 0) {
+    update.$addToSet = {
+      ...(emails.length > 0 ? { emails: { $each: emails } } : {}),
+      ...(phoneNumbers.length > 0
+        ? { phone_numbers: { $each: phoneNumbers } }
+        : {}),
+    };
+  }
+
+  return Object.keys(update).length > 0 ? update : null;
+};
+
 // ─── 1. Upsert a single UserLead ─────────────────────────────────────────────
 /**
  * Creates a UserLead record linking user → lead.
@@ -348,6 +423,33 @@ export const bulkResolveOrCreate = async (leadPayloads, linkContext) => {
   }
 
   // ── Step 6: bulk upsert UserLeads for ALL (new + cached) ─────────────────
+  if (cachedLeads.length > 0) {
+    const mergeOps = cachedLeads
+      .map((lead) => {
+        const update = buildCachedLeadMergeUpdate(lead);
+        if (!update) return null;
+
+        return {
+          updateOne: {
+            filter: { _id: lead._id },
+            update,
+          },
+        };
+      })
+      .filter(Boolean);
+
+    if (mergeOps.length > 0) {
+      try {
+        await Lead.bulkWrite(mergeOps, { ordered: false });
+      } catch (err) {
+        console.error(
+          "[UserLeadService] bulkResolveOrCreate cached lead merge error:",
+          err.message,
+        );
+      }
+    }
+  }
+
   const allLeadIds = [
     ...insertedLeads.map((l) => ({
       lead_id: l._id,
@@ -369,6 +471,7 @@ export const bulkResolveOrCreate = async (leadPayloads, linkContext) => {
 
   return {
     insertedLeads,
+    cachedLeads,
     userLeads: userLeadResult,
     cachedCount: cachedLeads.length,
     newCount: insertedLeads.length,

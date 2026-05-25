@@ -1,6 +1,7 @@
 import httpStatus from "http-status";
 import logger from "../utils/logger.js";
 import ApiError from "../utils/ApiError.js";
+import { bindErrorContext, captureException } from "../monitoring/index.js";
 
 const safeError = (err) => ({
   code: err.code || err.statusCode || 500,
@@ -30,8 +31,41 @@ const errorHandler = (err, req, res, next) => {
     ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
   };
 
-  if (process.env.NODE_ENV === "development") {
-    logger.error(err);
+  const errorContext = bindErrorContext({
+    req,
+    tags: {
+      status_code: statusCode,
+      is_operational: err.isOperational ?? true,
+    },
+    extra: {
+      status_code: statusCode,
+    },
+  });
+
+  if (statusCode >= 500 || err.isOperational === false) {
+    logger.error(
+      {
+        err,
+        request_id: req?.requestId,
+        method: req?.method,
+        path: req?.originalUrl,
+        status_code: statusCode,
+        user_id: req?.user?._id?.toString?.() || null,
+      },
+      "request failed",
+    );
+    captureException(err, errorContext);
+  } else if (process.env.NODE_ENV === "development") {
+    logger.warn(
+      {
+        err,
+        request_id: req?.requestId,
+        method: req?.method,
+        path: req?.originalUrl,
+        status_code: statusCode,
+      },
+      "request rejected",
+    );
   }
 
   res.status(statusCode).json(response);

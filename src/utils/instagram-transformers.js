@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { splitName, uniqueValues, parseCount } from "./instagram-helpers.js";
-import { extractEmails, extractPhones } from "./extractor.js";
+import { extractEmails, extractPhones, extractUrls } from "./extractor.js";
 
 /**
  * Transform Apify Instagram data to internal lead format
@@ -21,6 +21,7 @@ export const transformApifyToLead = (apifyData) => {
   const externalUrls = uniqueValues(
     [
       apifyData.externalUrl,
+      ...extractUrls(apifyData.biography || ""),
       ...(Array.isArray(apifyData.externalUrls)
         ? apifyData.externalUrls.map((link) => link.url).filter(Boolean)
         : []),
@@ -74,6 +75,7 @@ export const transformSteadyAPIToLead = (steadyData) => {
   const externalUrls = uniqueValues(
     [
       steadyData.external_url,
+      ...extractUrls(steadyData.biography || ""),
       ...(Array.isArray(steadyData.bio_links)
         ? steadyData.bio_links.map((link) => link.url).filter(Boolean)
         : []),

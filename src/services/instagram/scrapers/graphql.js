@@ -9,6 +9,10 @@ import accountPool from "../../accountPoolService.js";
 import { splitName, humanDelay } from "../../../utils/instagram-helpers.js";
 import { scrapeWithApify, scrapeWithApifyBulk } from "../integrations/apify.js";
 import {
+  applyContactSnapshotToProfile,
+  buildDeepScanTargetsForLeads,
+} from "../contactEnrichmentService.js";
+import {
   DEEP_SCAN_RELATIONSHIP_ENABLED,
   enqueueDeepScanBatch,
 } from "../../deepScanService.js";
@@ -112,58 +116,79 @@ async function deepScanBatch(users) {
 function buildLeadDoc({ user, type, targetUsername, folder_id, user_id }) {
   const { first_name, last_name } = splitName(user.full_name || "");
   const scan = user.deep_scan;
+  const contactReadyUser = applyContactSnapshotToProfile(user);
 
   return {
     first_name,
     last_name,
-    company: user.username || "",
-    emails: [...new Set([...(user.emails || []), ...(scan?.emails || [])])],
+    company: contactReadyUser.username || "",
+    emails: [
+      ...new Set([
+        ...(contactReadyUser.emails || []),
+        ...(scan?.emails || []),
+      ]),
+    ],
     phone_numbers: [
-      ...new Set([...(user.phone_numbers || []), ...(scan?.phone_numbers || [])]),
+      ...new Set([
+        ...(contactReadyUser.phone_numbers || []),
+        ...(scan?.phone_numbers || []),
+      ]),
     ],
     message: `
 ${relationshipScrapeTitle(type)} (GraphQL)
 
 Target Profile: @${targetUsername}
-Username: @${user.username || "N/A"}
-Full Name: ${user.full_name || "N/A"}
-Bio: ${user.bio || "N/A"}
-Followers: ${user.followers || "N/A"}
-Following: ${user.following || "N/A"}
-Posts: ${user.posts_count || "N/A"}
-Verified: ${user.is_verified ? "Yes" : "No"}
-Private: ${user.is_private ? "Yes" : "No"}
-Category: ${user.category || "N/A"}
-External URL: ${user.external_url || "N/A"}
+Username: @${contactReadyUser.username || "N/A"}
+Full Name: ${contactReadyUser.full_name || "N/A"}
+Bio: ${contactReadyUser.bio || "N/A"}
+Followers: ${contactReadyUser.followers || "N/A"}
+Following: ${contactReadyUser.following || "N/A"}
+Posts: ${contactReadyUser.posts_count || "N/A"}
+Verified: ${contactReadyUser.is_verified ? "Yes" : "No"}
+Private: ${contactReadyUser.is_private ? "Yes" : "No"}
+Category: ${contactReadyUser.category || "N/A"}
+External URL: ${contactReadyUser.external_url || "N/A"}
 Deep Scan URL: ${scan?.source_url || "N/A"}
-Profile URL: https://www.instagram.com/${user.username}
+Profile URL: https://www.instagram.com/${contactReadyUser.username}
 Scraping Method: GraphQL API
+${contactReadyUser.emails?.length ? `Emails: ${contactReadyUser.emails.join(", ")}` : ""}
+${contactReadyUser.phone_numbers?.length ? `Phone Numbers: ${contactReadyUser.phone_numbers.join(", ")}` : ""}
     `.trim(),
     scraped_from_username: targetUsername,
     relationship_type: toRelationshipDirection(type),
-    source_url: `https://www.instagram.com/${user.username}`,
-    source_rul: `https://www.instagram.com/${user.username}`,
-    instagram_profile_id: user.id !== user.username ? user.id : null,
-    username: user.username,
-    full_name: user.full_name,
-    bio: user.bio,
-    avatar_url: user.avatar,
-    avatar_rul: user.avatar,
-    followers: user.followers,
-    following: user.following,
-    follower_count: user.followers,
-    following_count: user.following,
-    total_posts: user.posts_count,
-    category: user.category,
-    external_url: user.external_url,
+    source_url: `https://www.instagram.com/${contactReadyUser.username}`,
+    source_rul: `https://www.instagram.com/${contactReadyUser.username}`,
+    instagram_profile_id:
+      contactReadyUser.id !== contactReadyUser.username
+        ? contactReadyUser.id
+        : null,
+    username: contactReadyUser.username,
+    full_name: contactReadyUser.full_name,
+    bio: contactReadyUser.bio,
+    avatar_url: contactReadyUser.avatar,
+    avatar_rul: contactReadyUser.avatar,
+    followers: contactReadyUser.followers,
+    following: contactReadyUser.following,
+    follower_count: contactReadyUser.followers,
+    following_count: contactReadyUser.following,
+    total_posts: contactReadyUser.posts_count,
+    category: contactReadyUser.category,
+    external_url: contactReadyUser.external_url,
     external_url_linkshimmed: null,
-    external_urls: user.external_url ? [user.external_url] : [],
-    is_private: user.is_private,
-    is_verified: user.is_verified,
-    is_public: user.is_private !== null ? !user.is_private : null,
+    external_urls: contactReadyUser.external_urls || [],
+    is_private: contactReadyUser.is_private,
+    is_verified: contactReadyUser.is_verified,
+    is_public:
+      contactReadyUser.is_private !== null ? !contactReadyUser.is_private : null,
     fb_profile_biolink: null,
     highlight_reel_count: null,
-    links: [],
+    links: contactReadyUser.links || [],
+    deep_scan_status:
+      DEEP_SCAN_RELATIONSHIP_ENABLED &&
+      Array.isArray(contactReadyUser.external_urls) &&
+      contactReadyUser.external_urls.length > 0
+        ? "PENDING"
+        : null,
     folder_id: folder_id || null,
     user_id: user_id || null,
     type: "INSTAGRAM",
@@ -395,7 +420,16 @@ export const scrapeFollowersOrFollowingGraphQL = async ({
             is_verified: a?.verified ?? user.is_verified,
             is_private: a?.private ?? user.is_private,
             external_url: a?.externalUrl || null,
+            external_urls: Array.isArray(a?.externalUrls)
+              ? a.externalUrls
+                  .map((entry) =>
+                    typeof entry === "string" ? entry : entry?.url,
+                  )
+                  .filter(Boolean)
+              : [],
+            links: Array.isArray(a?.externalUrls) ? a.externalUrls : [],
             posts_count: a?.postsCount ?? null,
+            raw_profile: a || null,
           };
         });
 
@@ -418,6 +452,8 @@ export const scrapeFollowersOrFollowingGraphQL = async ({
           is_verified: user.is_verified,
           is_private: user.is_private,
           external_url: null,
+          external_urls: [],
+          links: [],
           posts_count: null,
         }));
       }
@@ -467,11 +503,8 @@ export const scrapeFollowersOrFollowingGraphQL = async ({
 
         if (DEEP_SCAN_RELATIONSHIP_ENABLED) {
           const scanTargets = cycleInserted
-            .map((lead) => ({
-              lead_id: lead?._id,
-              url: lead?.external_url || lead?.external_urls?.[0] || null,
-            }))
-            .filter((target) => target.lead_id && target.url);
+            ? buildDeepScanTargetsForLeads(cycleInserted)
+            : [];
 
           enqueueDeepScanBatch({
             user_id,

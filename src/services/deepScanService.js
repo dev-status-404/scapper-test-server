@@ -1,14 +1,24 @@
 import axios from "axios";
+import { DelayedError, Queue, QueueEvents, Worker } from "bullmq";
 import * as cheerio from "cheerio";
 import crypto from "crypto";
 import dns from "dns/promises";
 import net from "net";
-import { DelayedError, Queue, Worker } from "bullmq";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { getRedisConnectionOptions, getSharedRedisClient } from "../config/redis.js";
 import DeepScanResult from "../models/deepScanResult.model.js";
 import Lead from "../models/lead.model.js";
+import {
+  bindErrorContext,
+  captureException,
+  withMonitoringSpan,
+} from "../monitoring/index.js";
 import { getIO } from "../websockets/index.js";
-import { extractEmails, extractPhones } from "../utils/extractor.js";
+import {
+  extractEmails,
+  extractPhones,
+  normalizeEmailCandidate,
+} from "../utils/extractor.js";
 import { getNextProxyConfig, proxyConfigToUrl } from "../config/instagram-proxy.js";
 import { sanitizeForLog } from "./instagram/utils/logSanitizer.js";
 
@@ -23,6 +33,8 @@ export const DEEP_SCAN_RELATIONSHIP_ENABLED =
   process.env.DEEP_SCAN_RELATIONSHIP_ENABLED === "true";
 export const DEEP_SCAN_INLINE_SINGLE_PROFILE =
   process.env.DEEP_SCAN_INLINE_SINGLE_PROFILE === "true";
+export const DEEP_SCAN_DIRECT_FALLBACK_ENABLED =
+  process.env.DEEP_SCAN_DIRECT_FALLBACK_ENABLED !== "false";
 
 export const DEEP_SCAN_TIMEOUT_MS = clampNumber(
   process.env.DEEP_SCAN_TIMEOUT_MS,
@@ -84,6 +96,12 @@ export const DEEP_SCAN_CONCURRENCY_PER_DOMAIN = clampNumber(
   5,
   1,
 );
+export const DEEP_SCAN_ISOLATION_TTL_MS = clampNumber(
+  process.env.DEEP_SCAN_ISOLATION_TTL_MS,
+  5000,
+  10 * 60 * 1000,
+  Math.max(60_000, DEEP_SCAN_TIMEOUT_MS * 4),
+);
 
 export const SKIP_DOMAINS = [
   "instagram.com",
@@ -113,26 +131,13 @@ export const SKIP_DOMAINS = [
   "stan.store",
 ];
 
-// const redisConnection = {
-//   host: process.env.REDIS_HOST || "127.0.0.1",
-//   port: Number.parseInt(process.env.REDIS_PORT || "6379", 10),
-//   ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}),
-// };
-const redisConnection = {
-  host: process.env.REDIS_HOST || "127.0.0.1",
-  port: parseInt(process.env.REDIS_PORT || "6379", 10),
-  username: process.env.REDIS_USERNAME || "default",
-  ...(process.env.REDIS_PASSWORD
-    ? { password: process.env.REDIS_PASSWORD }
-    : {}),
-  ...(process.env.REDIS_TLS === "true" ? { tls: {} } : {}),
-  maxRetriesPerRequest: null,
-};
-
 const activeDomainLocks = new Map();
 const activeUserLocks = new Map();
+const DEEP_SCAN_QUEUE_NAME = "deep-scan";
+const DEEP_SCAN_QUEUE_PREFIX = process.env.DEEP_SCAN_QUEUE_PREFIX || "bull";
 let deepScanQueue = null;
 let deepScanWorker = null;
+let deepScanQueueEvents = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -146,20 +151,83 @@ const decrementLock = (locks, key) => {
   else locks.set(key, remaining);
 };
 
-export const getDeepScanIsolationKeys = ({ user_id, url }) => {
-  const normalizedUrl = normalizeDeepScanUrl(url);
-  return {
-    normalized_url: normalizedUrl,
-    user_key: user_id ? String(user_id) : "anonymous",
-    root_domain: normalizedUrl ? getRootDomain(new URL(normalizedUrl).hostname) : null,
-  };
+const DEEP_SCAN_ISOLATION_ACQUIRE_SCRIPT = `
+local userKey = KEYS[1]
+local domainKey = KEYS[2]
+local userLimit = tonumber(ARGV[1])
+local domainLimit = tonumber(ARGV[2])
+local ttlMs = tonumber(ARGV[3])
+
+local userCount = tonumber(redis.call("get", userKey) or "0")
+if userCount >= userLimit then
+  return {0, "user-concurrency-limit"}
+end
+
+local domainCount = tonumber(redis.call("get", domainKey) or "0")
+if domainCount >= domainLimit then
+  return {0, "domain-concurrency-limit"}
+end
+
+redis.call("incr", userKey)
+redis.call("pexpire", userKey, ttlMs)
+redis.call("incr", domainKey)
+redis.call("pexpire", domainKey, ttlMs)
+
+return {1, "acquired"}
+`;
+
+const DEEP_SCAN_ISOLATION_RELEASE_SCRIPT = `
+local userKey = KEYS[1]
+local domainKey = KEYS[2]
+
+local userCount = tonumber(redis.call("get", userKey) or "0")
+if userCount > 1 then
+  redis.call("decr", userKey)
+elseif userCount == 1 then
+  redis.call("del", userKey)
+end
+
+local domainCount = tonumber(redis.call("get", domainKey) or "0")
+if domainCount > 1 then
+  redis.call("decr", domainKey)
+elseif domainCount == 1 then
+  redis.call("del", domainKey)
+end
+
+return 1
+`;
+
+const buildIsolationRedisKey = (scope, key) => `deep-scan:isolation:${scope}:${key}`;
+
+const shouldUseRedisIsolation = () => process.env.NODE_ENV !== "test";
+
+const startIsolationHeartbeat = (redis, keys) => {
+  const intervalMs = Math.max(1000, Math.floor(DEEP_SCAN_ISOLATION_TTL_MS / 3));
+  const timer = setInterval(() => {
+    redis
+      .multi()
+      .pexpire(keys.userKey, DEEP_SCAN_ISOLATION_TTL_MS)
+      .pexpire(keys.domainKey, DEEP_SCAN_ISOLATION_TTL_MS)
+      .exec()
+      .catch((error) => {
+        console.warn(
+          `[DeepScan] Isolation heartbeat failed: ${error?.message || "unknown-error"}`,
+        );
+      });
+  }, intervalMs);
+
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+
+  return () => clearInterval(timer);
 };
 
-export const tryAcquireDeepScanIsolation = ({ user_id, url }) => {
+const acquireInMemoryIsolation = ({ user_id, url }) => {
   const keys = getDeepScanIsolationKeys({ user_id, url });
 
   if (!keys.normalized_url || !keys.root_domain) {
-    return { acquired: true, ...keys, release: () => {} };
+    return { acquired: true, ...keys, release: async () => {} };
   }
 
   if ((activeUserLocks.get(keys.user_key) || 0) >= DEEP_SCAN_CONCURRENCY_PER_USER) {
@@ -177,13 +245,82 @@ export const tryAcquireDeepScanIsolation = ({ user_id, url }) => {
   return {
     acquired: true,
     ...keys,
-    release: () => {
+    release: async () => {
       if (released) return;
       released = true;
       decrementLock(activeUserLocks, keys.user_key);
       decrementLock(activeDomainLocks, keys.root_domain);
     },
   };
+};
+
+export const getDeepScanIsolationKeys = ({ user_id, url }) => {
+  const normalizedUrl = normalizeDeepScanUrl(url);
+  return {
+    normalized_url: normalizedUrl,
+    user_key: user_id ? String(user_id) : "anonymous",
+    root_domain: normalizedUrl ? getRootDomain(new URL(normalizedUrl).hostname) : null,
+  };
+};
+
+export const tryAcquireDeepScanIsolation = async ({ user_id, url }) => {
+  const keys = getDeepScanIsolationKeys({ user_id, url });
+
+  if (!keys.normalized_url || !keys.root_domain) {
+    return { acquired: true, ...keys, release: async () => {} };
+  }
+
+  if (!shouldUseRedisIsolation()) {
+    return acquireInMemoryIsolation({ user_id, url });
+  }
+
+  const redis = getSharedRedisClient();
+  const redisKeys = {
+    userKey: buildIsolationRedisKey("user", keys.user_key),
+    domainKey: buildIsolationRedisKey("domain", keys.root_domain),
+  };
+
+  try {
+    const [acquiredRaw, reason] = await redis.eval(
+      DEEP_SCAN_ISOLATION_ACQUIRE_SCRIPT,
+      2,
+      redisKeys.userKey,
+      redisKeys.domainKey,
+      String(DEEP_SCAN_CONCURRENCY_PER_USER),
+      String(DEEP_SCAN_CONCURRENCY_PER_DOMAIN),
+      String(DEEP_SCAN_ISOLATION_TTL_MS),
+    );
+
+    if (Number(acquiredRaw) !== 1) {
+      return { acquired: false, reason: String(reason || "isolation-unavailable"), ...keys };
+    }
+
+    const stopHeartbeat = startIsolationHeartbeat(redis, redisKeys);
+    let released = false;
+
+    return {
+      acquired: true,
+      ...keys,
+      release: async () => {
+        if (released) return;
+        released = true;
+        stopHeartbeat();
+        await redis.eval(
+          DEEP_SCAN_ISOLATION_RELEASE_SCRIPT,
+          2,
+          redisKeys.userKey,
+          redisKeys.domainKey,
+        );
+      },
+    };
+  } catch (error) {
+    logDeepScan("deep_scan_isolation_error", {
+      normalized_url: keys.normalized_url,
+      root_domain: keys.root_domain,
+      error_message: error?.message || "redis-isolation-error",
+    });
+    throw error;
+  }
 };
 
 const logDeepScan = (event, payload = {}) => {
@@ -292,6 +429,15 @@ export const validateUrlSafeToFetch = async (url) => {
 const getErrorStatus = (error) =>
   error?.response?.status ?? error?.response?.statusCode ?? error?.statusCode ?? error?.status;
 
+export const shouldRetryDeepScanWithoutProxy = (error, { proxyUsed = true } = {}) => {
+  if (!proxyUsed || !DEEP_SCAN_DIRECT_FALLBACK_ENABLED) {
+    return false;
+  }
+
+  const status = getErrorStatus(error);
+  return [401, 403, 407].includes(status);
+};
+
 export const isDeepScanRetryableError = (error) => {
   const status = getErrorStatus(error);
   const message = String(error?.message || "").toLowerCase();
@@ -313,7 +459,7 @@ const normalizePhones = (phones = []) =>
     .filter((phone) => phone.replace(/\D/g, "").length >= 7);
 
 const normalizeEmails = (emails = []) =>
-  [...new Set(emails.map((email) => String(email || "").trim().toLowerCase()).filter(Boolean))]
+  [...new Set(emails.map((email) => normalizeEmailCandidate(email)).filter(Boolean))]
     .filter((email) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email));
 
 const extractJsonLdContacts = ($) => {
@@ -415,10 +561,12 @@ const makeResultPayload = ({
   skipped: status === "SKIPPED",
 });
 
-const toLegacyResult = (result) => ({
+const toLegacyResult = (result, extra = {}) => ({
   ...result,
   source_url: result.normalized_url,
   skipped: result.status === "SKIPPED",
+  cached: false,
+  ...extra,
 });
 
 const buildExpiresAt = () =>
@@ -470,6 +618,68 @@ export const getCachedDeepScanResult = async (
   return cached || null;
 };
 
+export const previewDeepScanRequest = async (
+  url,
+  { resultModel = DeepScanResult } = {},
+) => {
+  const normalizedUrl = normalizeDeepScanUrl(url);
+
+  if (!normalizedUrl) {
+    return {
+      ok: false,
+      statusCode: 400,
+      reason: "invalid-url",
+      normalized_url: null,
+      billable: false,
+      cached_result: null,
+    };
+  }
+
+  const cached = await getCachedDeepScanResult(normalizedUrl, resultModel);
+  if (cached) {
+    return {
+      ok: true,
+      statusCode: 200,
+      reason: "cache-hit",
+      normalized_url: normalizedUrl,
+      billable: false,
+      cached_result: toLegacyResult(cached, { cached: true }),
+    };
+  }
+
+  if (shouldSkipDeepScanDomain(normalizedUrl)) {
+    return {
+      ok: true,
+      statusCode: 200,
+      reason: "skipped-domain",
+      normalized_url: normalizedUrl,
+      billable: false,
+      cached_result: null,
+    };
+  }
+
+  const safety = await validateUrlSafeToFetch(normalizedUrl);
+  if (!safety.safe) {
+    return {
+      ok: true,
+      statusCode: 200,
+      reason: safety.reason,
+      normalized_url: normalizedUrl,
+      billable: false,
+      cached_result: null,
+    };
+  }
+
+  return {
+    ok: true,
+    statusCode: 200,
+    reason: "fresh-scan",
+    normalized_url: normalizedUrl,
+    billable: true,
+    cached_result: null,
+  };
+};
+
 const emitDeepScanProgress = ({
   job_id,
   user_id,
@@ -502,19 +712,14 @@ const emitDeepScanProgress = ({
   }
 };
 
-const fetchPage = async (url, { attempt, axiosClient = axios } = {}) => {
-  const proxyConfig = getNextProxyConfig();
-  const proxyAgent = new HttpsProxyAgent(proxyConfigToUrl(proxyConfig));
-  return axiosClient.get(url, {
+const buildFetchConfig = ({ attempt, useProxy }) => {
+  const config = {
     timeout: DEEP_SCAN_TIMEOUT_MS,
     maxRedirects: DEEP_SCAN_MAX_REDIRECTS,
     maxContentLength: DEEP_SCAN_MAX_CONTENT_BYTES,
     responseType: "text",
     responseEncoding: "utf8",
     validateStatus: (status) => status >= 200 && status < 300,
-    httpsAgent: proxyAgent,
-    httpAgent: proxyAgent,
-    proxy: false,
     headers: {
       "User-Agent":
         process.env.DEEP_SCAN_USER_AGENT ||
@@ -530,7 +735,41 @@ const fetchPage = async (url, { attempt, axiosClient = axios } = {}) => {
       }
     },
     metadata: { attempt },
-  });
+  };
+
+  if (useProxy) {
+    const proxyConfig = getNextProxyConfig();
+    const proxyAgent = new HttpsProxyAgent(proxyConfigToUrl(proxyConfig));
+    config.httpsAgent = proxyAgent;
+    config.httpAgent = proxyAgent;
+    config.proxy = false;
+  }
+
+  return config;
+};
+
+const fetchPage = async (url, { attempt, axiosClient = axios } = {}) => {
+  try {
+    return await axiosClient.get(
+      url,
+      buildFetchConfig({ attempt, useProxy: true }),
+    );
+  } catch (error) {
+    if (!shouldRetryDeepScanWithoutProxy(error, { proxyUsed: true })) {
+      throw error;
+    }
+
+    logDeepScan("deep_scan_direct_fallback", {
+      normalized_url: normalizeDeepScanUrl(url),
+      status: "RETRYING_DIRECT",
+      reason: error?.message || "proxy-blocked",
+    });
+
+    return axiosClient.get(
+      url,
+      buildFetchConfig({ attempt, useProxy: false }),
+    );
+  }
 };
 
 export const deepScanUrl = async (url, options = {}) => {
@@ -590,7 +829,7 @@ export const deepScanUrl = async (url, options = {}) => {
       phones_found: cached.phone_numbers?.length || 0,
       cached: true,
     });
-    return toLegacyResult(cached);
+    return toLegacyResult(cached, { cached: true });
   }
 
   const safety = await validateUrlSafeToFetch(normalizedUrl);
@@ -747,6 +986,45 @@ export const attachDeepScanResultToLeads = async ({
   if (!ids.length || !result?.normalized_url) return { matched: 0 };
 
   const persisted = await persistResult({ result, leadIds: ids, resultModel });
+
+  if (typeof leadModel.bulkWrite === "function") {
+    const operations = ids.map((leadId) => ({
+      updateOne: {
+        filter: { _id: leadId },
+        update: {
+          $set: {
+            deep_scan_status: result.status,
+            deep_scan_result_id: persisted._id,
+          },
+          $addToSet: {
+            emails: { $each: normalizeEmails(result.emails || []) },
+            phone_numbers: { $each: normalizePhones(result.phone_numbers || []) },
+          },
+        },
+      },
+    }));
+
+    const bulkResult = await leadModel.bulkWrite(operations, { ordered: false });
+    for (const leadId of ids) {
+      logDeepScan("deep_scan_attached_to_lead", {
+        lead_id: String(leadId),
+        normalized_url: result.normalized_url,
+        root_domain: result.root_domain,
+        status: result.status,
+        emails_found: result.emails?.length || 0,
+        phones_found: result.phone_numbers?.length || 0,
+      });
+    }
+
+    return {
+      matched:
+        bulkResult?.matchedCount ??
+        bulkResult?.modifiedCount ??
+        bulkResult?.result?.nMatched ??
+        ids.length,
+    };
+  }
+
   for (const leadId of ids) {
     const lead = await leadModel.findById(leadId);
     if (!lead) continue;
@@ -764,6 +1042,7 @@ export const attachDeepScanResultToLeads = async ({
       phones_found: result.phone_numbers?.length || 0,
     });
   }
+
   return { matched: ids.length };
 };
 
@@ -775,8 +1054,11 @@ export const buildDeepScanQueueJobId = (normalizedUrl) =>
 
 const getDeepScanQueue = () => {
   if (!deepScanQueue) {
-    deepScanQueue = new Queue("deep-scan", {
-      connection: redisConnection,
+    deepScanQueue = new Queue(DEEP_SCAN_QUEUE_NAME, {
+      connection: getRedisConnectionOptions({
+        connectionName: "deep-scan-queue",
+      }),
+      prefix: DEEP_SCAN_QUEUE_PREFIX,
       defaultJobOptions: {
         attempts: DEEP_SCAN_MAX_ATTEMPTS,
         backoff: { type: "exponential", delay: DEEP_SCAN_RETRY_DELAY_MS },
@@ -786,6 +1068,30 @@ const getDeepScanQueue = () => {
     });
   }
   return deepScanQueue;
+};
+
+const getDeepScanQueueEvents = () => {
+  if (!deepScanQueueEvents) {
+    deepScanQueueEvents = new QueueEvents(DEEP_SCAN_QUEUE_NAME, {
+      connection: getRedisConnectionOptions({
+        connectionName: "deep-scan-queue-events",
+      }),
+      prefix: DEEP_SCAN_QUEUE_PREFIX,
+    });
+    deepScanQueueEvents.on("error", (error) => {
+      console.error(
+        `[DeepScan] Queue events error: ${error?.message || "unknown-error"}`,
+      );
+      captureException(
+        error,
+        bindErrorContext({
+          tags: { area: "deep-scan", event: "queue-events-error" },
+        }),
+      );
+    });
+  }
+
+  return deepScanQueueEvents;
 };
 
 export const enqueueDeepScanForLead = async ({ user_id, lead_id, url, job_id, username = null }) => {
@@ -848,62 +1154,123 @@ export const enqueueDeepScanBatch = async ({ user_id, lead_ids = [], urls = [], 
   };
 };
 
-export const processDeepScanJob = async (job) => {
-  const { url, user_id, lead_id, job_id } = job.data || {};
-  const normalizedUrl = normalizeDeepScanUrl(url);
-  const isolation = tryAcquireDeepScanIsolation({ user_id, url });
-  if (!isolation.acquired) {
-    const delayUntil = Date.now() + DEEP_SCAN_RETRY_DELAY_MS;
-    await job.moveToDelayed(delayUntil, job.token);
-    logDeepScan("deep_scan_delayed_for_isolation", {
-      job_id,
-      user_id,
-      normalized_url: isolation.normalized_url,
-      root_domain: isolation.root_domain,
-      status: "DELAYED",
-      reason: isolation.reason,
-      elapsed_ms: 0,
-    });
-    throw new DelayedError();
-  }
+export const processDeepScanJob = async (job, token) => {
+  return withMonitoringSpan(
+    "queue.deepScan.process",
+    {
+      op: "queue.process",
+      attributes: {
+        "queue.name": DEEP_SCAN_QUEUE_NAME,
+        "queue.job_id": job?.id || null,
+        "user.id": job?.data?.user_id || null,
+        "lead.id": job?.data?.lead_id || null,
+        "url.normalized": normalizeDeepScanUrl(job?.data?.url) || null,
+      },
+    },
+    async () => {
+      const { url, user_id, lead_id, job_id } = job.data || {};
+      const normalizedUrl = normalizeDeepScanUrl(url);
+      const isolation = await tryAcquireDeepScanIsolation({ user_id, url });
+      if (!isolation.acquired) {
+        await job.moveToDelayed(Date.now() + DEEP_SCAN_RETRY_DELAY_MS, token);
+        logDeepScan("deep_scan_delayed_for_isolation", {
+          job_id,
+          user_id,
+          normalized_url: isolation.normalized_url,
+          root_domain: isolation.root_domain,
+          status: "DELAYED",
+          reason: isolation.reason,
+          elapsed_ms: 0,
+        });
+        throw new DelayedError();
+      }
 
-  try {
-    const result = await deepScanUrl(url, {
-      user_id,
-      lead_id,
-      job_id,
-      retryDelayMs: DEEP_SCAN_RETRY_DELAY_MS,
-      skipDomainLock: true,
-    });
-    const persisted = normalizedUrl
-      ? await DeepScanResult.findOne({ normalized_url: normalizedUrl }).lean()
-      : null;
-    const relatedLeadIds = persisted?.source_lead_ids?.length
-      ? persisted.source_lead_ids
-      : [lead_id];
+      try {
+        if (normalizedUrl) {
+          await DeepScanResult.findOneAndUpdate(
+            { normalized_url: normalizedUrl },
+            {
+              $set: {
+                status: "RUNNING",
+                error_type: null,
+                error_message: null,
+              },
+            },
+          );
+        }
 
-    await attachDeepScanResultToLeads({ result, leadIds: relatedLeadIds });
-    emitDeepScanProgress({
-      job_id,
-      user_id,
-      lead_id,
-      normalized_url: result.normalized_url,
-      status: result.status,
-      emails_found: result.emails?.length || 0,
-      phones_found: result.phone_numbers?.length || 0,
-    });
-    return result;
-  } finally {
-    isolation.release();
-  }
+        const result = await deepScanUrl(url, {
+          user_id,
+          lead_id,
+          job_id,
+          retryDelayMs: DEEP_SCAN_RETRY_DELAY_MS,
+          skipDomainLock: true,
+        });
+        const persisted = normalizedUrl
+          ? await DeepScanResult.findOne({ normalized_url: normalizedUrl }).lean()
+          : null;
+        const relatedLeadIds = persisted?.source_lead_ids?.length
+          ? persisted.source_lead_ids
+          : [lead_id];
+
+        await attachDeepScanResultToLeads({ result, leadIds: relatedLeadIds });
+        emitDeepScanProgress({
+          job_id,
+          user_id,
+          lead_id,
+          normalized_url: result.normalized_url,
+          status: result.status,
+          emails_found: result.emails?.length || 0,
+          phones_found: result.phone_numbers?.length || 0,
+        });
+        return result;
+      } finally {
+        await isolation.release();
+      }
+    },
+  );
 };
 
 export const createDeepScanWorker = () => {
   if (!DEEP_SCAN_ENABLED) return null;
   if (deepScanWorker) return deepScanWorker;
-  deepScanWorker = new Worker("deep-scan", processDeepScanJob, {
-    connection: redisConnection,
+  getDeepScanQueue();
+  getDeepScanQueueEvents();
+
+  deepScanWorker = new Worker(DEEP_SCAN_QUEUE_NAME, processDeepScanJob, {
+    connection: getRedisConnectionOptions({
+      connectionName: "deep-scan-worker",
+    }),
+    prefix: DEEP_SCAN_QUEUE_PREFIX,
     concurrency: DEEP_SCAN_CONCURRENCY_GLOBAL,
+  });
+  deepScanWorker.on("error", (error) => {
+    console.error(`[DeepScan] Worker error: ${error?.message || "unknown-error"}`);
+    captureException(
+      error,
+      bindErrorContext({
+        tags: { area: "deep-scan", event: "worker-error" },
+      }),
+    );
+  });
+  deepScanWorker.on("failed", (job, error) => {
+    captureException(
+      error,
+      bindErrorContext({
+        tags: {
+          area: "deep-scan",
+          event: "job-failed",
+          queue: DEEP_SCAN_QUEUE_NAME,
+          job_id: job?.id || null,
+        },
+        extra: {
+          user_id: job?.data?.user_id || null,
+          lead_id: job?.data?.lead_id || null,
+          url: job?.data?.url || null,
+          attempts_made: job?.attemptsMade || 0,
+        },
+      }),
+    );
   });
   return deepScanWorker;
 };
@@ -914,6 +1281,7 @@ export const deepScanExternalUrl = async (url, options = {}) =>
 export default {
   deepScanUrl,
   deepScanExternalUrl,
+  previewDeepScanRequest,
   enqueueDeepScanForLead,
   enqueueDeepScanBatch,
   processDeepScanJob,

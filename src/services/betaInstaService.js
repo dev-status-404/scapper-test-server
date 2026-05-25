@@ -22,6 +22,10 @@ import {
   relationshipScrapeTitle,
   toRelationshipDirection,
 } from "./instagram/relationshipTypes.js";
+import {
+  applyContactSnapshotToProfile,
+  buildDeepScanTargetsForLeads,
+} from "./instagram/contactEnrichmentService.js";
 import { RELATIONSHIP_PROVIDER_TYPES } from "./instagram/providers/providerTypes.js";
 import { ProviderUnsupportedOperationError } from "./instagram/errors.js";
 import {
@@ -849,13 +853,7 @@ const enqueueRelationshipDeepScans = ({
     return;
   }
 
-  const scanTargets = leads
-    .map((lead) => ({
-      lead_id: lead?._id,
-      url: lead?.external_url || lead?.external_urls?.[0] || null,
-    }))
-    .filter((target) => target.lead_id && target.url);
-
+  const scanTargets = buildDeepScanTargetsForLeads(leads);
   if (!scanTargets.length) {
     return;
   }
@@ -1410,7 +1408,10 @@ const saveInstagramRelationshipBatch = async ({
     enqueueRelationshipDeepScans({
       user_id,
       job_id: jobId,
-      leads: bulkResult.insertedLeads,
+      leads: [
+        ...(bulkResult.insertedLeads || []),
+        ...(bulkResult.cachedLeads || []),
+      ],
       label: "Instagram GraphQL",
     });
     console.log(
@@ -2936,7 +2937,18 @@ const scrapeFollowersOrFollowingGraphQL = async ({
                 is_verified: apifyData.verified || user.is_verified,
                 is_private: apifyData.private || user.is_private,
                 external_url: apifyData.externalUrl || null,
+                external_urls: Array.isArray(apifyData.externalUrls)
+                  ? apifyData.externalUrls
+                      .map((entry) =>
+                        typeof entry === "string" ? entry : entry?.url,
+                      )
+                      .filter(Boolean)
+                  : [],
+                links: Array.isArray(apifyData.externalUrls)
+                  ? apifyData.externalUrls
+                  : [],
                 posts_count: apifyData.postsCount || null,
+                raw_profile: apifyData,
               });
               console.log(
                 `[Apify] ✓ Enriched @${user.username} - Followers: ${apifyData.followersCount}`,
@@ -2955,6 +2967,8 @@ const scrapeFollowersOrFollowingGraphQL = async ({
                 is_verified: user.is_verified,
                 is_private: user.is_private,
                 external_url: null,
+                external_urls: [],
+                links: [],
                 posts_count: null,
               });
               console.log(`[Apify] ⚠️  No data returned for @${user.username}`);
@@ -2975,6 +2989,8 @@ const scrapeFollowersOrFollowingGraphQL = async ({
               is_verified: user.is_verified,
               is_private: user.is_private,
               external_url: null,
+              external_urls: [],
+              links: [],
               posts_count: null,
             });
           }
@@ -3000,6 +3016,8 @@ const scrapeFollowersOrFollowingGraphQL = async ({
             is_verified: user.is_verified,
             is_private: user.is_private,
             external_url: null,
+            external_urls: [],
+            links: [],
             posts_count: null,
             error: error.message,
           });
@@ -3015,34 +3033,7 @@ const scrapeFollowersOrFollowingGraphQL = async ({
     );
 
     for (const user of enrichedUsers) {
-      let allEmails = [];
-      let allPhones = [];
-
-      // Extract from bio
-      if (user.bio) {
-        const bioEmails = extractEmails(user.bio);
-        const bioPhones = extractPhones(user.bio);
-
-        if (bioEmails.length > 0) {
-          console.log(
-            `[Extract] Found ${bioEmails.length} email(s) in @${user.username}'s bio: ${bioEmails.join(", ")}`,
-          );
-          allEmails.push(...bioEmails);
-        }
-
-        if (bioPhones.length > 0) {
-          console.log(
-            `[Extract] Found ${bioPhones.length} phone(s) in @${user.username}'s bio: ${bioPhones.join(", ")}`,
-          );
-          allPhones.push(...bioPhones);
-        }
-      }
-
-      // Relationship deep scans are queued after leads are saved.
-
-      // Store unique emails and phones in user object
-      user.emails = uniqueValues(allEmails);
-      user.phone_numbers = uniqueValues(allPhones);
+      Object.assign(user, applyContactSnapshotToProfile(user));
 
       if (user.emails.length > 0 || user.phone_numbers.length > 0) {
         console.log(
@@ -3110,13 +3101,19 @@ ${user.phone_numbers && user.phone_numbers.length > 0 ? `Phone Numbers: ${user.p
             category: user.category,
             external_url: user.external_url,
             external_url_linkshimmed: null,
-            external_urls: user.external_url ? [user.external_url] : [],
+            external_urls: user.external_urls || [],
             is_private: user.is_private,
             is_verified: user.is_verified,
             is_public: user.is_private !== null ? !user.is_private : null,
             fb_profile_biolink: null,
             highlight_reel_count: null,
-            links: [],
+            links: user.links || [],
+            deep_scan_status:
+              DEEP_SCAN_RELATIONSHIP_ENABLED &&
+              Array.isArray(user.external_urls) &&
+              user.external_urls.length > 0
+                ? "PENDING"
+                : null,
             scrape_status: true,
             type: "INSTAGRAM",
           };
@@ -3153,7 +3150,10 @@ ${user.phone_numbers && user.phone_numbers.length > 0 ? `Phone Numbers: ${user.p
         enqueueRelationshipDeepScans({
           user_id,
           job_id: __job_id || null,
-          leads: insertedLeads,
+          leads: [
+            ...(insertedLeads || []),
+            ...(bulkResult.cachedLeads || []),
+          ],
           label: "Instagram GraphQL",
         });
         console.log(
@@ -4232,7 +4232,18 @@ const scrapeFollowersOrFollowing = async ({
                 is_verified: apifyData.verified || false,
                 is_private: apifyData.private || false,
                 external_url: apifyData.externalUrl || null,
+                external_urls: Array.isArray(apifyData.externalUrls)
+                  ? apifyData.externalUrls
+                      .map((entry) =>
+                        typeof entry === "string" ? entry : entry?.url,
+                      )
+                      .filter(Boolean)
+                  : [],
+                links: Array.isArray(apifyData.externalUrls)
+                  ? apifyData.externalUrls
+                  : [],
                 posts_count: apifyData.postsCount || null,
+                raw_profile: apifyData,
               });
               console.log(
                 `[Apify] ✓ Enriched @${user.username} - Followers: ${apifyData.followersCount}`,
@@ -4251,6 +4262,8 @@ const scrapeFollowersOrFollowing = async ({
                 is_verified: false,
                 is_private: false,
                 external_url: null,
+                external_urls: [],
+                links: [],
                 posts_count: null,
               });
               console.log(`[Apify] ⚠️  No data returned for @${user.username}`);
@@ -4274,6 +4287,8 @@ const scrapeFollowersOrFollowing = async ({
               is_verified: false,
               is_private: false,
               external_url: null,
+              external_urls: [],
+              links: [],
               posts_count: null,
             });
           }
@@ -4301,6 +4316,8 @@ const scrapeFollowersOrFollowing = async ({
             is_verified: false,
             is_private: false,
             external_url: null,
+            external_urls: [],
+            links: [],
             posts_count: null,
             error: error.message,
           });
@@ -4316,37 +4333,12 @@ const scrapeFollowersOrFollowing = async ({
     );
 
     let deepScanCount = 0;
-    const deepScanTotal = enrichedUsers.filter((u) => u.external_url).length;
+    const deepScanTotal = enrichedUsers.filter(
+      (user) => applyContactSnapshotToProfile(user).external_urls.length > 0,
+    ).length;
 
     for (const user of enrichedUsers) {
-      let allEmails = [];
-      let allPhones = [];
-
-      // Extract from bio
-      if (user.bio) {
-        const bioEmails = extractEmails(user.bio);
-        const bioPhones = extractPhones(user.bio);
-
-        if (bioEmails.length > 0) {
-          console.log(
-            `[Extract] Found ${bioEmails.length} email(s) in @${user.username}'s bio: ${bioEmails.join(", ")}`,
-          );
-          allEmails.push(...bioEmails);
-        }
-
-        if (bioPhones.length > 0) {
-          console.log(
-            `[Extract] Found ${bioPhones.length} phone(s) in @${user.username}'s bio: ${bioPhones.join(", ")}`,
-          );
-          allPhones.push(...bioPhones);
-        }
-      }
-
-      // Relationship deep scans are queued after leads are saved.
-
-      // Store unique emails and phones in user object
-      user.emails = uniqueValues(allEmails);
-      user.phone_numbers = uniqueValues(allPhones);
+      Object.assign(user, applyContactSnapshotToProfile(user));
 
       if (user.emails.length > 0 || user.phone_numbers.length > 0) {
         console.log(
@@ -4412,13 +4404,19 @@ ${user.phone_numbers && user.phone_numbers.length > 0 ? `Phone Numbers: ${user.p
             category: user.category,
             external_url: user.external_url,
             external_url_linkshimmed: null,
-            external_urls: user.external_url ? [user.external_url] : [],
+            external_urls: user.external_urls || [],
             is_private: user.is_private,
             is_verified: user.is_verified,
             is_public: user.is_private !== null ? !user.is_private : null,
             fb_profile_biolink: null,
             highlight_reel_count: null,
-            links: [],
+            links: user.links || [],
+            deep_scan_status:
+              DEEP_SCAN_RELATIONSHIP_ENABLED &&
+              Array.isArray(user.external_urls) &&
+              user.external_urls.length > 0
+                ? "PENDING"
+                : null,
             scrape_status: true,
             type: "INSTAGRAM",
           };
@@ -4455,7 +4453,10 @@ ${user.phone_numbers && user.phone_numbers.length > 0 ? `Phone Numbers: ${user.p
         enqueueRelationshipDeepScans({
           user_id,
           job_id,
-          leads: insertedLeads,
+          leads: [
+            ...(insertedLeads || []),
+            ...(bulkResult.cachedLeads || []),
+          ],
           label: "Instagram Puppeteer",
         });
         console.log(

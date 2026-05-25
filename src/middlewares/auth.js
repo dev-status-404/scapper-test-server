@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "../config/env.js";
 import ApiError from "../utils/ApiError.js";
 import User from "../models/user.model.js";
+import { setMonitoringUser } from "../monitoring/index.js";
 // import Admin from "../models/admin.model.js";
 
 /**
@@ -80,6 +81,7 @@ const auth = (allowedRoles = [], options = {}) => {
       // Attach user info to request
       req.user = user;
       req.isAdmin = isAdmin;
+      setMonitoringUser(user, req);
 
       return next();
     } catch (error) {

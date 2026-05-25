@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import logger from '../utils/logger.js';
+import { bindErrorContext, captureException, withMonitoringSpan } from '../monitoring/index.js';
 
 // Enable debug mode in development
 if (process.env.NODE_ENV === 'development') {
@@ -13,10 +14,19 @@ mongoose.set('strictQuery', true);
 
 const dbConnection = async () => {
   try {
-
-    const conn = await mongoose.connect(process.env.MONGODB_URI, {
-      serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
-    });
+    const conn = await withMonitoringSpan(
+      "mongodb.connect",
+      {
+        op: "db.connect",
+        attributes: {
+          "db.system": "mongodb",
+        },
+      },
+      () =>
+        mongoose.connect(process.env.MONGODB_URI, {
+          serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+        }),
+    );
 
     logger.info(`MongoDB Connected: ${conn.connection.host}`);
     
@@ -27,6 +37,15 @@ const dbConnection = async () => {
 
     mongoose.connection.on('error', (err) => {
       logger.error(`Mongoose connection error: ${err.message}`);
+      captureException(
+        err,
+        bindErrorContext({
+          tags: { area: 'mongodb', event: 'connection-error' },
+          extra: {
+            host: mongoose.connection.host || null,
+          },
+        }),
+      );
     });
 
     mongoose.connection.on('disconnected', () => {
@@ -43,6 +62,12 @@ const dbConnection = async () => {
     return mongoose.connection;
   } catch (error) {
     logger.error(`MongoDB connection error: ${error.message}`);
+    captureException(
+      error,
+      bindErrorContext({
+        tags: { area: 'mongodb', event: 'startup-connection-error' },
+      }),
+    );
     process.exit(1);
   }
 };

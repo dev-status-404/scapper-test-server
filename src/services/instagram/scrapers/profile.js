@@ -199,6 +199,10 @@ Scraped with: ${scrapedWith.toUpperCase()}
       fb_profile_biolink: null,
       highlight_reel_count: profileData.highlight_reel_count,
       links: profileData.links,
+      deep_scan_status:
+        !DEEP_SCAN_INLINE_SINGLE_PROFILE && externalUrls.length > 0
+          ? "PENDING"
+          : null,
       folder_id: folder_id || null,
       user_id: user_id || null,
       type: "INSTAGRAM",
